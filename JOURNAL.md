@@ -1,4 +1,35 @@
-# WorkdayAgent — Build Journal
+## 2026-05-06 — The day I learned git was being polite
+
+Spent ~30 min "stuck" trying to connect this project to its GitHub repo.
+Walked through the whole setup — installed GitHub CLI via winget, did the
+`gh auth login` browser dance, cd'd into the project, ran `git status`, all
+the right moves.
+
+Then I ran `git commit -m "..."` and got `nothing to commit, working tree
+clean`. Tried `git remote add origin ...` and got `error: remote origin
+already exists`. Tried `git push` and got `Everything up-to-date`.
+
+I learned the hard way that when git says "Everything up-to-date" it means
+"you're done, go home" — not "nothing happened, keep trying." `git log`
+showed three commits already there, including one that said "v0.0.1:
+initial scaffold with working popup, content script, and build journal."
+Past-Ben had already wired this up — probably via `gh repo create
+--source=. --push` during scaffolding — and present-Ben forgot.
+
+**What worked:** `gh auth login` is dramatically simpler than the old
+PAT/SSH dance on Windows. Browser auth, paste a one-time code, done.
+If you're starting fresh in 2026, this is the way.
+
+**What broke:** my mental model. I assumed every git command would
+either succeed loudly or fail loudly. Git has a third state — "this was
+already true, here's a terse one-liner that won't catch your eye."
+Slow down and read the output.
+
+**What's next:**
+- Write a real README so the repo doesn't look abandoned to anyone
+  clicking through from the eventual LinkedIn post
+- Back to the build itself — content script needs to start identifying
+  Workday form fields# WorkdayAgent — Build Journal
 
 **Working name:** `workday-autofill-agent` (GitHub repo) / "WorkdayAgent" (referential)
 **Started:** May 2026
