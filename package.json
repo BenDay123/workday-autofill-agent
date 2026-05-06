@@ -1,0 +1,28 @@
+{
+  "name": "workday-autofill-agent",
+  "version": "1.0.0",
+  "description": "An agent that completes job application forms for employers on Workday",
+  "main": "index.js",
+  "scripts": {
+  "dev": "vite",
+  "build": "vite build"
+},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BenDay123/workday-autofill-agent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/BenDay123/workday-autofill-agent/issues"
+  },
+  "homepage": "https://github.com/BenDay123/workday-autofill-agent#readme",
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.4.0",
+    "@types/chrome": "^0.1.40",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.10"
+  }
+}
