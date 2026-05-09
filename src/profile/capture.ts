@@ -265,7 +265,7 @@ export function captureFromScan(
       } else {
         const last = profile.workExperience[profile.workExperience.length - 1];
         if (last) {
-          (last as Record<string, unknown>)[fieldName] = value;
+          (last as unknown as Record<string, unknown>)[fieldName] = value;
         }
       }
       continue;
@@ -284,7 +284,7 @@ export function captureFromScan(
       } else {
         const last = profile.education[profile.education.length - 1];
         if (last) {
-          (last as Record<string, unknown>)[fieldName] = value;
+          (last as unknown as Record<string, unknown>)[fieldName] = value;
         }
       }
       continue;

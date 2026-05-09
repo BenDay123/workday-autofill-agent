@@ -319,7 +319,7 @@ Slow down and read the output.
 
 **Working name:** `workday-autofill-agent` (GitHub repo) / "WorkdayAgent" (referential)
 **Started:** May 2026
-**Status:** v0.0.4 in progress — full Workday application surveyed (5 steps, 76 fields); detection cleanup batch shipped and verified; profile data model architecturally complete; no fill logic yet
+**Status:** v0.0.5 in progress — fill logic built end-to-end (text/checkbox/radio/combobox/button-widget/date-pair handlers, content-script-only with native-setter trick, voluntary-disclosure visual cue, customAnswers fallback). Awaiting live verification on a Workday page; type-checking now active under strict mode.
 
 ## What this is
 
@@ -388,7 +388,6 @@ A Chrome extension that auto-fills Workday job applications, built in public as 
 - [x] Catalogue new widget patterns surfaced from later steps — paired button+listbox selects, dateSection split-input month/year, combobox typeahead with chip-state in context, multi-select skills typeahead, file upload `<input type="file">`, categorical "Select One" question buttons
 - [x] Profile data model: decisions locked (capture-from-Workday seed, chrome.storage.local + OPFS, auto-fill all incl. voluntary disclosures, hardcoded label patterns for v1, fill-time index-based for repeated entries)
 - [x] Implement profile schema — `src/profile/types.ts` written. Top-level `UserProfile` with: meta, identity, contact (address, phone), workExperience[], education[], skills[], websites[], optional resume (base64), workAuthorization (US-centric for v1), voluntaryDisclosures (gender / Hispanic-Latino / race-ethnicity / veteran / disability / recruitment-policy ack), preferences (relocation, non-compete, source), and customAnswers[] for application-specific Q&A.
-- [ ] Investigate empty `tsconfig.json` — file is 0 bytes, Vite/esbuild builds work because they're transpile-only, but no actual type-checking is happening. Add a real config and verify `npx tsc --noEmit` passes.
 - [x] Implement storage adapter — `src/profile/storage.ts` written: `getProfile()` / `saveProfile()` / `clearProfile()` / `hasProfile()` / `createEmptyProfile()`. All five functions go through `chrome.storage.local` under key `workdayAgent.profile`. `saveProfile` always stamps `meta.schemaVersion` and `meta.updatedAt`. Resume blob lives inside the profile as base64 (no OPFS yet — moves to OPFS only if 5 MB quota becomes a problem in practice).
 - [x] Implement label-pattern → profile-field mapping config — `src/profile/mapping.ts` written. ~30 mappings covering identity, contact, work experience, education, skills, websites, dates, source, application questions, and voluntary disclosures (full federal-standard EEO set, not just what this Workday tenant showed). Signals support match by label / context / text (either) / automationId / aria-label, with `string | RegExp` patterns. Path notation: dotted paths plus bracket-empty for repeated entries (`workExperience[].jobTitle`), keyed lookup for websites (`websites[label=LinkedIn].url`), and sentinels (`$dateMonth` / `$dateYear`) for date inputs that share automationIds across start/end. Order-sensitive — first match wins; phone-code Country comes before bare Country / Territory.
 - [x] Implement capture-from-Workday flow — `src/profile/capture.ts` written + popup wiring. Walks scanned fields in DOM order, looks up each via `findMapping`, transforms widget-specific values (Yes/No buttons → boolean, button widgets → `displayText`, comboboxes → context selection-chip), writes to profile. Block-walking for repeated structures: `jobTitle` starts a new `workExperience[]`; `school` starts a new `education[]`. Date inputs are paired by encounter order within a block (first pair = start, second pair = end). Unmatched fields with values fall through to `customAnswers`. New "Save as Profile" button in the popup runs the full pipeline (scan → capture → save → display saved profile JSON for review). Build clean (popup 2.94 kB → 10.26 kB; profile module joined the bundle). Not yet verified on a live page.
@@ -397,8 +396,10 @@ A Chrome extension that auto-fills Workday job applications, built in public as 
   - Custom-answer pattern derivation favored `context` over `label`, so the Workday-employee radio recorded as `{ pattern: "YesNo", answer: true }`. Fixed by preferring label first, and for radios with `Q → Option` labels, splitting the question and option so we get `{ pattern: "Have you previously worked for...?", answer: "No" }`.
 - [x] Verify capture on later steps — verified on a `useMyLastApplication` URL: all 5 work experiences captured with correct dates and `currentlyHere` flag (block walking and date sentinel pairing both work), education captured (no dates because Workday's tenant config doesn't ask), websites captured into the keyed `websites[label=X].url` lookup. Skills empty (typeahead chips not visible to scanner — known limitation). voluntaryDisclosures still empty because we didn't capture from that step in this session — would need either capture on Voluntary Disclosures step OR a separate fresh `/apply` flow that surfaces it.
 - [x] Implement and verify capture merge — single capture only sees the currently-rendered step, but the wedge requires building a complete profile across steps. Switched capture from overwrite to **merge by touched section**: capture tracks which top-level sections it actually wrote to (`identity`, `contact`, `workExperience`, etc.) via path-prefix detection, then `mergeWithExisting` replaces only those sections in the existing stored profile and preserves the rest. `meta.createdAt` is held from the original first capture; `meta.updatedAt` bumps each save. Verified on a real two-step sequence: My Experience capture (workExperience + education + websites populated, identity/contact empty) followed by contact-info capture from a different `useMyLastApplication` URL — result kept the original 5 work experiences and education/websites while populating identity and contact freshly.
-- [ ] Implement fill logic (dispatch React events per widget type)
-- [ ] v1 nice-to-have: fill-time visual cue when voluntary-disclosure fields are filled
+- [x] Implement fill logic — `src/profile/fill.ts` written. `fillFromProfile(profile, fields)` walks scanned fields, dispatches per widget type: text/textarea (native setter + input/change/blur events), checkbox/radio (click if state differs; radio matches by HTML value or extracted "Question → Option" label), combobox typeahead (focus + type + click match), button widget (click + wait for listbox + click match), date sentinels (per-block month/year queues). CustomAnswers fallback for fields without a canonical mapping (Workday-tenant-specific Q&A). Architectural choice: content-script-only with native-setter trick instead of CLAUDE.md's two-script pattern. Wired `FILL_FROM_PROFILE` message in content.ts and "Fill from Profile" button in popup. Built, not yet verified on a live page.
+- [x] v1 nice-to-have: fill-time visual cue for voluntary disclosures — `highlightFields()` in fill.ts applies a 3px amber outline + scrolls into view for 5s after fill completes. Triggered automatically for any field whose mapping path starts with `voluntaryDisclosures.`. Built, not yet verified.
+- [x] Investigate empty `tsconfig.json` — populated with strict mode, ES2022, bundler resolution, `@types/chrome`. First `tsc --noEmit` run caught two real type errors in `capture.ts` (unsafe casts to `Record<string, unknown>` from typed schemas); fixed by casting through `unknown`. Type-checking now runs clean.
+- [ ] Verify fill logic end-to-end on a live Workday page: load v0.0.5 build, navigate to a `useMyLastApplication` URL with rendered form, click "Fill from Profile", confirm text inputs populate (incl. native-setter trick works for React's value tracking), button widgets click+select correctly, radios match, checkboxes toggle. Watch for: combobox typing not opening listbox, button-widget timing issues, voluntary-disclosure highlight visible.
 - [ ] v2 (deferred): LLM-based semantic matching for fields not matched by hardcoded patterns
 - [ ] v2 (deferred): per-instance grouping in detection (handle "fresh start" Workday applications where blocks must be added before fill)
 - [x] Detection cleanup batch (built, not yet verified):
@@ -499,6 +500,118 @@ A Chrome extension that auto-fills Workday job applications, built in public as 
 - Verified capture on My Experience step (`useMyLastApplication` URL): all 5 work experiences with start/end dates, education, and websites captured cleanly. Block walking, date sentinel pairing, and section transitions all work.
 - Discovered overwrite-vs-merge architectural issue during verification: each capture only sees the currently-rendered step, so a single overwrite-save destroys data captured from other steps. Switched to merge-by-touched-section. Capture tracks which top-level sections it wrote to via path-prefix detection; new `mergeWithExisting` function in capture.ts replaces only those sections. Verified end-to-end across a two-step sequence: My Experience capture first, then contact-info capture from a different URL — result preserves all 5 work experiences while adding fresh identity/contact data.
 - Wrapped here. Fill logic — the actual demo — is the next session's first chunk.
+
+### Session 7.5 — Autonomous fill-logic chunk (Ben away from keyboard)
+
+Ben asked me (Claude) to keep working while he stepped away. Mandate
+was: ship as much as possible, commit locally only, document
+everything as built-not-verified, have a clean handoff ready for him
+to test on return.
+
+**What I built:**
+
+1. **`tsconfig.json` populated.** The file had been 0 bytes since
+   scaffolding, so no actual type-checking was running anywhere. New
+   config enables strict mode, ES2022 target, bundler module
+   resolution, and pulls in `@types/chrome`. First `npx tsc --noEmit`
+   run caught two real type errors in `capture.ts` — the
+   `(last as Record<string, unknown>)` casts were unsafe because
+   `WorkExperience` and `Education` lack index signatures. Fixed by
+   casting through `unknown` first. tsc passes clean now.
+
+2. **`src/profile/fill.ts`.** The fill engine:
+   - `fillFromProfile(profile, fields)` walks scanned fields in DOM
+     order, looks up each via `findMapping`, resolves the target value
+     from the profile, and dispatches to a per-widget-type handler.
+   - **Plain text inputs / textareas**: uses
+     `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set`
+     to bypass React's per-instance value-tracking monkey patch, then
+     dispatches `input` / `change` / `blur` events.
+   - **Checkbox**: clicks if `.checked !== shouldBeChecked`.
+   - **Radio**: matches by HTML value (`"true"` / `"false"`) OR by
+     extracting the option label from `Question → Option` format.
+   - **Combobox typeahead** (Workday's `selectinput-*` UUID pattern):
+     focus → fill input → wait for `[role="listbox"]` → click matching
+     option.
+   - **Button widget** (paired button-listbox): click button → wait
+     for listbox → click option matching `displayText`.
+   - **Date inputs** (`$dateMonth` / `$dateYear` sentinels): consumed
+     from per-block month/year queues that get refilled when a new
+     `workExperience` or `education` block starts. Same block-walking
+     state machine as capture, mirrored.
+   - **CustomAnswers fallback**: when a field doesn't map to a
+     canonical profile path, walk `profile.customAnswers` and match
+     by pattern substring against the field's label/context/aria-label.
+     Lets us fill the Workday-employee Yes/No question and similar
+     tenant-specific Q&A.
+   - **`highlightFields(elements, durationMs)`**: applies a 3px amber
+     outline + scrolls into view for 5 seconds, used after fill to
+     draw attention to voluntary-disclosure fields.
+
+3. **Architectural decision: content-script-only fill, NOT the
+   two-script (content + injected) pattern from CLAUDE.md.**
+   Reasoning: the React-input-tracking issue that motivates the
+   two-script architecture is solved by using the prototype's native
+   value setter from any JS context that holds the element reference.
+   Content scripts can read the prototype, get the setter, and call
+   it on the live DOM element — no separate page-world execution
+   needed. Saves the complexity of script injection, message channels
+   between worlds, and timing coordination. Documented as a v1 choice;
+   if we hit a Workday widget where this fails (Shadow DOM, React
+   internals deeper than we expect), the fallback is to add the
+   injected script as a second script entry. CLAUDE.md updated to
+   reflect this choice. Made this call autonomously per Ben's
+   "make architectural calls and document" instruction.
+
+4. **Wired `FILL_FROM_PROFILE` into content.ts.** Receives profile
+   from popup, scans current page, builds `FillField[]` (zips fields
+   with their live elements), runs `fillFromProfile`, logs result to
+   page console, calls `highlightFields` for voluntary disclosures,
+   and reports counts back to popup. Returns `true` from the message
+   listener so the channel stays open for the async fill.
+
+5. **"Fill from Profile" button in popup.** Reads stored profile,
+   sends `FILL_FROM_PROFILE` to content script, displays counts in
+   status (`✓ Filled N, skipped M, K errors. X voluntary-disclosure
+   field(s) highlighted on page for review.`). If errors are
+   reported, the textarea fills with the error JSON for inspection.
+
+**What I did NOT do:**
+
+- Verify any of this on a live Workday page. Can't — I don't have
+  browser access. Everything in this chunk is "built, not yet
+  verified" until Ben tests it.
+- Push to remote. Per instructions, committed locally only.
+- Touch the file-upload widget — known browser-security limitation;
+  silently skipped in fill logic with a comment.
+
+**Known risks Ben should look for during verification:**
+
+- **Combobox typing**: Workday's typeahead may need a real focus event
+  before `input` events register. If the listbox doesn't open after
+  fill writes the search text, this is the cause and we'd add an
+  explicit `focus()` plus a small delay before typing.
+- **Button-widget timing**: 2-second `waitForElement` for the listbox
+  may not be enough on slow connections. Bump to 3-5s if listboxes
+  routinely don't appear in time.
+- **Sequential vs parallel async fills**: I made fill fully `await`-ed
+  per field so button-widget listboxes don't overlap. This is slow
+  for forms with many button widgets, but correct. Might want a
+  progress indicator in the popup if a full-page fill takes >5s.
+- **Yes/No customAnswer matching**: relies on the radio's `Question →
+  Option` label format being preserved. If a Workday tenant renders
+  radios differently (no group label, or label only carries the
+  option), this breaks and falls through to skipped.
+- **Repeated structures**: fill assumes Workday has rendered the right
+  number of `workExperience` blocks (and ditto `education`). If the
+  user is on a fresh `/apply` flow with only one block rendered, only
+  `workExperience[0]` fills. Documented as a v1 limitation; v2 needs
+  to click "Add Another" to expand.
+
+**Build state at handoff:**
+- All TypeScript type-checks pass under strict mode (`npx tsc --noEmit`)
+- `npm run build` clean: 13 modules, content.ts 10.07 kB, popup 8.47 kB
+- Local commit pending (do not push without Ben's review)
 
 ### Session 6 — Full survey, detection cleanup, data model architecture
 - Worked through all 5 steps of the live Workday application; catalogued 76 unique fields and every Workday widget pattern we're likely to see (paired button+listbox, combobox-with-chip-state, dateSection split inputs, multi-select skills, file upload, categorical question buttons).

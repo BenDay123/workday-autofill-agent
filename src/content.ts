@@ -1,6 +1,11 @@
 // WorkdayAgent — content script
-// Scans the page for form fields and logs a structured report to the console.
-// No filling yet; this is observability only.
+// Scans the page for form fields and handles fill-from-profile requests
+// from the popup. Runs in the page's content-script (isolated) world, but
+// uses HTMLInputElement.prototype's native value setter to bypass React's
+// per-instance value tracking — no separate injected script needed for v1.
+
+import type { UserProfile } from './profile/types';
+import { fillFromProfile, highlightFields, type FillField } from './profile/fill';
 
 interface FieldInfo {
   tagName: string;
@@ -282,5 +287,49 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'SCAN_FIELDS') {
     const { count, fields } = logScan('on-demand scan');
     sendResponse({ count, json: JSON.stringify(fields, null, 2) });
+    return;
+  }
+
+  if (message?.type === 'FILL_FROM_PROFILE') {
+    const profile = message.profile as UserProfile | undefined;
+    if (!profile) {
+      sendResponse({ error: 'No profile in message payload' });
+      return;
+    }
+
+    const { fields, elements } = scan();
+    const fillFields: FillField[] = fields.map((f, i) => ({
+      ...f,
+      el: elements[i],
+    }));
+
+    fillFromProfile(profile, fillFields)
+      .then((result) => {
+        console.group(
+          `%c[WorkdayAgent] fill complete — ${result.filled} filled, ${result.skipped} skipped, ${result.errors.length} errors`,
+          'color: #f59e0b; font-weight: bold',
+        );
+        if (result.errors.length > 0) console.table(result.errors);
+        if (result.voluntaryDisclosureFieldsFilled.length > 0) {
+          console.log(
+            `%cVoluntary-disclosure fields populated: ${result.voluntaryDisclosureFieldsFilled.length} (highlighted on page for 5s)`,
+            'color: #f59e0b',
+          );
+          highlightFields(result.voluntaryDisclosureFieldsFilled);
+        }
+        console.groupEnd();
+        sendResponse({
+          filled: result.filled,
+          skipped: result.skipped,
+          errors: result.errors,
+          voluntaryDisclosureCount: result.voluntaryDisclosureFieldsFilled.length,
+        });
+      })
+      .catch((err) => {
+        console.error('[WorkdayAgent] fill failed:', err);
+        sendResponse({ error: (err as Error).message ?? 'fill failed' });
+      });
+
+    return true; // keep message channel open for async sendResponse
   }
 });

@@ -28,7 +28,16 @@ A Chrome extension that fills Workday job applications. Build-in-public.
 
 ## Architectural decisions made so far
 - Two-script architecture (content script + injected script with message
-  passing) is required for Workday's React-controlled inputs.
+  passing) was originally documented as required for Workday's
+  React-controlled inputs, but v1 fill logic actually uses
+  content-script-only with the native-setter trick (use
+  `Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set`
+  to bypass React's per-instance value tracking, then dispatch
+  `input` / `change` / `blur`). This works because the prototype's
+  setter is callable from any JS context that has a reference to the
+  DOM element. The two-script pattern is the documented fallback if
+  we hit a widget where content-script-only fails (e.g., Shadow DOM
+  or deeper React internals).
 - Selector priority: data-automation-id > data-uxi-element-id >
   aria-label/role. Never rely on class names or wd-prefixed IDs.
 - Fill technique: dispatch React's events (input/change/blur), don't
