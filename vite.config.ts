@@ -6,7 +6,7 @@ const manifest = defineManifest({
   name: 'WorkdayAgent',
   version: '0.0.1',
   description: 'Auto-fill Workday job applications. Built in public.',
-  permissions: ['storage', 'activeTab'],
+  permissions: ['storage', 'activeTab', 'clipboardWrite'],
   host_permissions: ['https://*.myworkdayjobs.com/*'],
   action: {
     default_popup: 'src/popup/popup.html',
