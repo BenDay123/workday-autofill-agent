@@ -330,7 +330,7 @@ async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string
     console.log(`[WorkdayAgent] fillButtonWidget: clicking option "${match.textContent?.trim()}" for target "${targetValue}"`);
     dispatchClickSequence(match);
   } else {
-    console.log(`[WorkdayAgent] fillButtonWidget: no option matched "${targetValue}"`);
+    logListboxMismatch('fillButtonWidget', targetValue);
   }
 }
 
@@ -372,7 +372,30 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
     }
   }
 
-  console.log(`[WorkdayAgent] fillCombobox: no option matched "${targetValue}"`);
+  logListboxMismatch('fillCombobox', targetValue);
+}
+
+// Dump the actual options visible in the latest listbox when a match fails,
+// alongside the search variants we tried. Helps diagnose why a captured
+// value (e.g., "United States of America (+1)") doesn't match Workday's
+// rendered options (which may be shorter, abbreviated, or formatted
+// differently).
+function logListboxMismatch(callerName: string, targetValue: string): void {
+  const variants = searchVariants(targetValue);
+  const listboxes = document.querySelectorAll('[role="listbox"]');
+  if (listboxes.length === 0) {
+    console.log(
+      `[WorkdayAgent] ${callerName}: no option matched "${targetValue}". Listbox is closed/missing. Searched variants: ${JSON.stringify(variants)}`,
+    );
+    return;
+  }
+  const listbox = listboxes[listboxes.length - 1];
+  const options = Array.from(listbox.querySelectorAll('[role="option"]'));
+  const optionLabels = options.map((o) => o.textContent?.trim() ?? '');
+  console.log(
+    `[WorkdayAgent] ${callerName}: no option matched "${targetValue}". Searched variants: ${JSON.stringify(variants)}. Listbox has ${options.length} option(s):`,
+    optionLabels,
+  );
 }
 
 // Workday option handlers often need a full pointer/mouse event sequence
