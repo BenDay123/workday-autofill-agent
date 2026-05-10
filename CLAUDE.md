@@ -65,11 +65,14 @@ A Chrome extension that fills Workday job applications. Build-in-public.
 - Capture-from-Workday is multi-step: each capture only sees fields
   rendered on the currently-visible Workday step. To build a complete
   profile, the user clicks "Save as Profile" on each step they navigate
-  through. The popup uses `mergeWithExisting` to replace only the
-  top-level sections the current capture touched — fields not visible
-  on the current step are preserved from the prior stored profile.
-  `meta.createdAt` is held at the first-ever capture; `meta.updatedAt`
-  bumps on each save.
+  through. The popup uses `mergeWithExisting` to apply only the
+  granular paths the current capture actually wrote — object leaves
+  (e.g., `preferences.preferredSource`), array sections all-or-nothing
+  (`workExperience[]`), and keyed entries (`websites[label=LinkedIn]`,
+  `customAnswers[pattern=...]`). Fields not visible on the current step
+  are preserved from the prior stored profile, including sibling fields
+  in the same section that capture didn't touch. `meta.createdAt` is
+  held at the first-ever capture; `meta.updatedAt` bumps on each save.
 - Field mapping (v1): hardcoded label-pattern matchers (Map of regex
   → profile field). Unmatched fields are skipped and left for manual
   entry. Circle back to LLM semantic matching for v2 — that's the

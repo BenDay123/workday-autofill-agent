@@ -142,7 +142,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     let merged;
     try {
       const existing = await getProfile();
-      merged = mergeWithExisting(existing, result.profile, result.touchedSections);
+      merged = mergeWithExisting(existing, result.profile, result.touchedPaths);
       await saveProfile(merged);
     } catch (err) {
       console.error('saveProfile failed:', err);
@@ -152,7 +152,13 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       return;
     }
 
-    const sections = Array.from(result.touchedSections).join(', ') || 'none';
+    // Derive a readable section summary from the granular touched paths.
+    const sectionSet = new Set<string>();
+    for (const p of result.touchedPaths) {
+      const head = p.split('[')[0].split('.')[0];
+      if (head) sectionSet.add(head);
+    }
+    const sections = Array.from(sectionSet).join(', ') || 'none';
     setOutput(JSON.stringify(merged, null, 2));
     setStatus(
       `✓ Merged. ${result.matched} matched, ${result.unmatched} unmatched, ${result.capturedCustomAnswers} custom answers. Updated: ${sections}.`,

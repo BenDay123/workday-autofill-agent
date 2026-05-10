@@ -49,49 +49,52 @@ export interface CaptureResult {
   unmatched: number;
   capturedCustomAnswers: number;
   /**
-   * Top-level profile sections this capture actually touched. Used by
-   * `mergeWithExisting` to selectively replace sections instead of
-   * blowing away the entire profile on each capture.
+   * Granular path identifiers this capture actually wrote. Used by
+   * `mergeWithExisting` to merge per-path into an existing profile
+   * instead of replacing whole top-level sections (which would let
+   * `createEmptyProfile` defaults overwrite previously-captured values
+   * for fields not rendered on the current Workday step).
+   *
+   * Path forms:
+   *   - Object leaf path: `"identity.firstName"`,
+   *     `"contact.address.line1"`, `"preferences.preferredSource"`,
+   *     `"voluntaryDisclosures.gender"`. Merged by deep-set of that one
+   *     leaf into the existing profile.
+   *   - Array-section marker (all-or-nothing replace):
+   *     `"workExperience[]"`, `"education[]"`, `"skills[]"`,
+   *     `"resume"`.
+   *   - Keyed array entry (replace/append by key):
+   *     `"websites[label=LinkedIn]"`,
+   *     `"customAnswers[pattern=Have you previously...?]"`.
    */
-  touchedSections: Set<ProfileSection>;
+  touchedPaths: Set<string>;
 }
 
-export type ProfileSection =
-  | 'identity'
-  | 'contact'
-  | 'workExperience'
-  | 'education'
-  | 'skills'
-  | 'websites'
-  | 'resume'
-  | 'workAuthorization'
-  | 'voluntaryDisclosures'
-  | 'preferences'
-  | 'customAnswers';
-
-const KNOWN_SECTIONS: ReadonlySet<ProfileSection> = new Set([
-  'identity',
-  'contact',
-  'workExperience',
-  'education',
-  'skills',
-  'websites',
-  'resume',
-  'workAuthorization',
-  'voluntaryDisclosures',
-  'preferences',
-  'customAnswers',
-]);
-
-function sectionFromPath(path: string): ProfileSection | null {
-  // "workExperience[].jobTitle" → "workExperience"
-  // "contact.address.line1"     → "contact"
-  // "$dateMonth"                → null (sentinel; handled by flushBlock)
+/**
+ * Convert a mapping path (or sentinel) into the touched-path identifier
+ * we record for later merge. Returns null for sentinels and skills (which
+ * capture currently doesn't write).
+ */
+function touchedPathFor(path: string): string | null {
   if (path.startsWith('$')) return null;
-  const head = path.split('[')[0].split('.')[0];
-  return KNOWN_SECTIONS.has(head as ProfileSection)
-    ? (head as ProfileSection)
-    : null;
+
+  // Array sections — collapse to a single section marker. Capture writes
+  // these as whole arrays per step, so merge replaces all-or-nothing.
+  if (path.startsWith('workExperience[].') || path === 'workExperience[]') {
+    return 'workExperience[]';
+  }
+  if (path.startsWith('education[].') || path === 'education[]') {
+    return 'education[]';
+  }
+  if (path === 'skills') return 'skills[]';
+  if (path === 'resume') return 'resume';
+
+  // Keyed website entry: websites[label=X].url → websites[label=X]
+  const websiteMatch = path.match(/^(websites\[label=[^\]]+\])\.url$/);
+  if (websiteMatch) return websiteMatch[1];
+
+  // Plain dotted leaf path — record as-is.
+  return path;
 }
 
 /** Read the user-meaningful value from a scanned field. */
@@ -175,13 +178,13 @@ export function captureFromScan(
   let matched = 0;
   let unmatched = 0;
   let capturedCustomAnswers = 0;
-  const touchedSections = new Set<ProfileSection>();
+  const touchedPaths = new Set<string>();
 
   const block: BlockState = { type: null, months: [], years: [] };
 
   function touch(path: string): void {
-    const section = sectionFromPath(path);
-    if (section) touchedSections.add(section);
+    const id = touchedPathFor(path);
+    if (id) touchedPaths.add(id);
   }
 
   for (const field of fields) {
@@ -218,12 +221,13 @@ export function captureFromScan(
       }
 
       if (pattern) {
+        const trimmedPattern = pattern.slice(0, 200);
         profile.customAnswers.push({
-          pattern: pattern.slice(0, 200),
+          pattern: trimmedPattern,
           answer,
         });
         capturedCustomAnswers++;
-        touchedSections.add('customAnswers');
+        touchedPaths.add(`customAnswers[pattern=${trimmedPattern}]`);
       }
       unmatched++;
       continue;
@@ -319,13 +323,23 @@ export function captureFromScan(
   // Flush the last block.
   flushBlock(profile, block);
 
-  return { profile, matched, unmatched, capturedCustomAnswers, touchedSections };
+  return { profile, matched, unmatched, capturedCustomAnswers, touchedPaths };
 }
 
 /**
  * Merge a freshly-captured profile into the existing stored profile,
- * replacing only the top-level sections that this capture actually touched.
- * If there's no existing profile, returns the captured profile as-is.
+ * applying only the paths this capture actually wrote. If there's no
+ * existing profile, returns the captured profile as-is.
+ *
+ * Per-path semantics (see CaptureResult.touchedPaths for the path forms):
+ *   - Object leaf path: deep-set just that one leaf in the existing
+ *     profile. Avoids `createEmptyProfile` defaults overwriting fields
+ *     that weren't on the current Workday step.
+ *   - Array-section marker: replace the entire array (or set the whole
+ *     resume blob) — these don't merge sensibly per-element across
+ *     captures.
+ *   - Keyed array entry: find an entry with the same key in the existing
+ *     array; replace it if found, otherwise append.
  *
  * meta.createdAt is preserved from the existing profile so we don't lose
  * the original "first capture" timestamp.
@@ -333,29 +347,84 @@ export function captureFromScan(
 export function mergeWithExisting(
   existing: UserProfile | null,
   captured: UserProfile,
-  touched: Set<ProfileSection>,
+  touched: Set<string>,
 ): UserProfile {
   if (!existing) return captured;
 
-  const merged: UserProfile = { ...existing };
+  // Deep clone so we don't mutate the stored object.
+  const merged: UserProfile = JSON.parse(JSON.stringify(existing));
 
   merged.meta = {
     ...captured.meta,
     createdAt: existing.meta.createdAt,
   };
 
-  // Explicit per-section dispatch so TypeScript can verify shapes.
-  if (touched.has('identity')) merged.identity = captured.identity;
-  if (touched.has('contact')) merged.contact = captured.contact;
-  if (touched.has('workExperience')) merged.workExperience = captured.workExperience;
-  if (touched.has('education')) merged.education = captured.education;
-  if (touched.has('skills')) merged.skills = captured.skills;
-  if (touched.has('websites')) merged.websites = captured.websites;
-  if (touched.has('resume')) merged.resume = captured.resume;
-  if (touched.has('workAuthorization')) merged.workAuthorization = captured.workAuthorization;
-  if (touched.has('voluntaryDisclosures')) merged.voluntaryDisclosures = captured.voluntaryDisclosures;
-  if (touched.has('preferences')) merged.preferences = captured.preferences;
-  if (touched.has('customAnswers')) merged.customAnswers = captured.customAnswers;
+  for (const path of touched) {
+    applyTouchedPath(merged, captured, path);
+  }
 
   return merged;
+}
+
+function applyTouchedPath(
+  merged: UserProfile,
+  captured: UserProfile,
+  path: string,
+): void {
+  // Array sections — replace whole array / blob.
+  if (path === 'workExperience[]') {
+    merged.workExperience = captured.workExperience;
+    return;
+  }
+  if (path === 'education[]') {
+    merged.education = captured.education;
+    return;
+  }
+  if (path === 'skills[]') {
+    merged.skills = captured.skills;
+    return;
+  }
+  if (path === 'resume') {
+    merged.resume = captured.resume;
+    return;
+  }
+
+  // Keyed websites: websites[label=X]
+  const websiteMatch = path.match(/^websites\[label=([^\]]+)\]$/);
+  if (websiteMatch) {
+    const label = websiteMatch[1];
+    const capturedEntry = captured.websites.find((w) => w.label === label);
+    if (!capturedEntry) return;
+    const idx = merged.websites.findIndex((w) => w.label === label);
+    if (idx >= 0) merged.websites[idx] = capturedEntry;
+    else merged.websites.push(capturedEntry);
+    return;
+  }
+
+  // Keyed customAnswers: customAnswers[pattern=X]
+  const customAnswerMatch = path.match(/^customAnswers\[pattern=(.+)\]$/);
+  if (customAnswerMatch) {
+    const pattern = customAnswerMatch[1];
+    const capturedEntry = captured.customAnswers.find((a) => a.pattern === pattern);
+    if (!capturedEntry) return;
+    const idx = merged.customAnswers.findIndex((a) => a.pattern === pattern);
+    if (idx >= 0) merged.customAnswers[idx] = capturedEntry;
+    else merged.customAnswers.push(capturedEntry);
+    return;
+  }
+
+  // Plain dotted leaf path — copy that one value from captured into merged.
+  const value = getByPath(captured as unknown as Record<string, unknown>, path);
+  if (value === undefined) return;
+  setByPath(merged as unknown as Record<string, unknown>, path, value);
+}
+
+function getByPath(target: Record<string, unknown>, path: string): unknown {
+  const parts = path.split('.');
+  let cursor: unknown = target;
+  for (const key of parts) {
+    if (cursor == null || typeof cursor !== 'object') return undefined;
+    cursor = (cursor as Record<string, unknown>)[key];
+  }
+  return cursor;
 }
