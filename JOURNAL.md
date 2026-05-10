@@ -319,7 +319,7 @@ Slow down and read the output.
 
 **Working name:** `workday-autofill-agent` (GitHub repo) / "WorkdayAgent" (referential)
 **Started:** May 2026
-**Status:** v0.0.5 in progress — fill logic built end-to-end (text/checkbox/radio/combobox/button-widget/date-pair handlers, content-script-only with native-setter trick, voluntary-disclosure visual cue, customAnswers fallback). Awaiting live verification on a Workday page; type-checking now active under strict mode.
+**Status:** v0.0.5 partially verified — fill logic confirmed working for text inputs / button widgets (Country, State, Phone Type) / radios / checkboxes / customAnswers (Workday-employee Yes/No). Two combobox bugs surfaced and need fixes next session: (1) merge architecture too aggressive — section-replace overrides existing field values with createEmptyProfile defaults when the current step doesn't have those fields, causing `preferences.preferredSource` to silently get dropped; (2) Country / Territory Phone Code combobox can't match Workday's option text ("United States of America (+1)" doesn't appear in the option list — Workday probably renders it differently).
 
 ## What this is
 
@@ -612,6 +612,102 @@ to test on return.
 - All TypeScript type-checks pass under strict mode (`npx tsc --noEmit`)
 - `npm run build` clean: 13 modules, content.ts 10.07 kB, popup 8.47 kB
 - Local commit pending (do not push without Ben's review)
+
+### Session 7.6 — Live fill verification + combobox iteration
+
+Ben tested the fill build (`v0.0.5`) on real Workday application pages.
+Result: **most of the fill logic works**, with two real bugs surfaced and
+diagnosed.
+
+**What's confirmed working from `fillByWidget` logs:**
+
+- Text inputs (First Name, Middle Name, Last Name, Address Line 1, City,
+  Postal Code, Phone Number) — all dispatched correctly
+- Button widgets (Country / Territory, State, Phone Device Type) — listbox
+  opened and matching options clicked via the new pointer+mouse+click
+  sequence
+- Checkboxes / radios (SMS opt-in, Workday-employee Yes/No) — toggled to
+  the correct state via `customAnswer` fallback for the radio Q&A
+- Native value setter trick on `HTMLInputElement.prototype` works in
+  content-script context (no injected script needed) — confirmed by text
+  inputs sticking with values that React tracks
+
+**Bug 1 — Merge architecture too aggressive (in capture.ts):**
+
+Each capture only sees fields rendered on the current Workday step. The
+current `mergeWithExisting` replaces an entire top-level section if any
+field in it was touched. Problem: when a contact-info capture touches
+`preferences.preferredSource`, the new `preferences` object only has
+that field set to a value — `willingToRelocate` and
+`hasNonCompeteRestrictions` are at their `createEmptyProfile` defaults
+(both `false`). Section-replace then writes the defaults over any
+previously-captured `true` values from an Application Questions step.
+
+Same pattern can happen the other way: an Application Questions capture
+touches `preferences.willingToRelocate` but has no `preferredSource`
+set — section-replace would drop the `"Job Alert"` we'd previously
+captured. **This is exactly what happened to Ben.** His profile lost
+`preferredSource` mid-session, which is why fill silently skipped
+"How Did You Hear About Us" on the next test (no `fillByWidget`
+log for that path).
+
+**Fix path (deferred):** track touched paths at field-level granularity
+during capture, not just touched sections. Merge replaces only the
+paths that were actually written. Or alternatively, deep-merge object
+sections preferring captured values only when non-empty (with a known
+limitation that boolean `false` from a default can't be distinguished
+from a captured `false`).
+
+**Bug 2 — Country / Territory Phone Code combobox option mismatch:**
+
+Profile stores the value as captured: `"United States of America (+1)"`.
+But Workday's option list in the listbox apparently doesn't have any
+option containing that exact string. My `searchVariants` helper tries
+`"United States of America (+1)"`, then `"United States of America"`
+(parens stripped) — neither matches. Likely Workday renders the option
+as just `"United States"` or a flag + abbreviation.
+
+**Fix path (deferred):** when a combobox match fails, log the actual
+option labels in the listbox so we can see what Workday offers, then
+either store a more match-friendly value in the profile OR widen the
+search variants further.
+
+**Build / Chrome cache gotcha encountered:**
+
+Each Vite build produces new content-hashed filenames and deletes the
+prior ones from `dist/`. Chrome's content-script registration is keyed
+by the hashed filename in the manifest; if you reload the page but
+not the extension, Chrome tries to fetch the previous-build file
+which no longer exists, producing a `net::ERR_FILE_NOT_FOUND` error
+on the dynamic import. Ben hit this exactly during testing today.
+**Always reload extension AND page after each build.** The
+extension off/on toggle is more reliable than the reload icon when
+the manifest paths have changed.
+
+**What got committed in this chunk:**
+- Fill iteration: combobox click-before-type, no-blur, polled match,
+  pointer+mouse+click event sequences for option clicks (synthetic
+  `.click()` alone wasn't enough for Workday option handlers),
+  search variants stripping parenthetical suffixes
+- `fillByWidget` entry-point logging so each dispatch is traced
+- Diagnostic logs in `fillCombobox` and `fillButtonWidget` that name
+  exactly which option was matched and clicked
+
+**What's open for next session:**
+- Re-capture profile from a `useMyLastApplication` URL with the source
+  dropdown populated, so `preferences.preferredSource` is restored
+- Implement field-level path tracking in capture + merge (the real fix
+  for Bug 1)
+- Add "log all options in listbox" diagnostic when a combobox match
+  fails (helps fix Bug 2)
+- Verify whether button-widget option clicks are actually changing
+  Workday's selection or whether Workday's `autofillWithResume` flow
+  was just pre-populating those — try a clean `useMyLastApplication`
+  URL where the fields are blank, then fill from profile, see what
+  actually changes
+- Voluntary-disclosure fill-time visual cue — wasn't testable today
+  because the test URLs don't have voluntary disclosures rendered on
+  the contact-info step
 
 ### Session 6 — Full survey, detection cleanup, data model architecture
 - Worked through all 5 steps of the live Workday application; catalogued 76 unique fields and every Workday widget pattern we're likely to see (paired button+listbox, combobox-with-chip-state, dateSection split inputs, multi-select skills, file upload, categorical question buttons).

@@ -206,6 +206,7 @@ async function fillByWidget(
   const el = field.el;
   const tag = field.tagName;
   const type = field.type;
+  console.log(`[WorkdayAgent] fillByWidget: path=${path} tag=${tag} type=${type} uxi=${field.uxiElementId} value=${JSON.stringify(value).slice(0, 60)}`);
 
   // Track voluntary-disclosure fields for the visual cue.
   const isVoluntaryDisclosure = path.startsWith('voluntaryDisclosures.');
@@ -316,36 +317,129 @@ function fillSelect(el: HTMLSelectElement, value: string): void {
 }
 
 async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string): Promise<void> {
-  buttonEl.click();
+  // Open the dropdown with full click sequence.
+  dispatchClickSequence(buttonEl);
   const listbox = await waitForElement('[role="listbox"]', 2000);
-  if (!listbox) return;
-
-  const options = Array.from(listbox.querySelectorAll('[role="option"]'));
-  const target = targetValue.toLowerCase();
-
-  let match = options.find((opt) => opt.textContent?.trim().toLowerCase() === target);
-  if (!match) {
-    match = options.find((opt) => opt.textContent?.trim().toLowerCase().includes(target));
+  if (!listbox) {
+    console.log(`[WorkdayAgent] fillButtonWidget: listbox didn't appear for "${targetValue}"`);
+    return;
   }
+
+  const match = findOptionMatchInLatestListbox(targetValue);
   if (match) {
-    (match as HTMLElement).click();
+    console.log(`[WorkdayAgent] fillButtonWidget: clicking option "${match.textContent?.trim()}" for target "${targetValue}"`);
+    dispatchClickSequence(match);
+  } else {
+    console.log(`[WorkdayAgent] fillButtonWidget: no option matched "${targetValue}"`);
   }
 }
 
+// Workday's combobox typeahead is finicky:
+//   - Needs a click to open the listbox (focus alone isn't enough)
+//   - Listbox closes if the input dispatches `blur` mid-flow
+//   - Workday filters on `input` events but may need a moment to render
+//   - Sometimes the option you want is in the initial unfiltered list, so
+//     we should look for it before typing
 async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<void> {
+  // Step 1: open the dropdown via full click sequence (synthetic .click()
+  // alone may not register with Workday's pointer-event handlers).
+  dispatchClickSequence(inputEl);
   inputEl.focus();
-  fillTextInput(inputEl, targetValue);
-  const listbox = await waitForElement('[role="listbox"]', 2000);
-  if (!listbox) return;
+  await sleep(150);
 
-  const options = Array.from(listbox.querySelectorAll('[role="option"]'));
-  const target = targetValue.toLowerCase();
-  const match =
-    options.find((opt) => opt.textContent?.trim().toLowerCase() === target) ||
-    options.find((opt) => opt.textContent?.trim().toLowerCase().includes(target));
+  // Step 2: try matching against the initial (unfiltered) listbox first.
+  let match = findOptionMatchInLatestListbox(targetValue);
   if (match) {
-    (match as HTMLElement).click();
+    console.log(`[WorkdayAgent] fillCombobox: clicking unfiltered match for "${targetValue}":`, match.textContent?.trim());
+    dispatchClickSequence(match);
+    return;
   }
+
+  // Step 3: type to filter. Set value via prototype + dispatch input/change
+  // ONLY (no blur — that'd close the listbox).
+  setInputValueViaProto(inputEl, targetValue);
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+  inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+
+  // Step 4: give Workday up to 1.5s to filter, polling for a match.
+  for (let i = 0; i < 6; i++) {
+    await sleep(250);
+    match = findOptionMatchInLatestListbox(targetValue);
+    if (match) {
+      console.log(`[WorkdayAgent] fillCombobox: clicking filtered match for "${targetValue}":`, match.textContent?.trim());
+      dispatchClickSequence(match);
+      return;
+    }
+  }
+
+  console.log(`[WorkdayAgent] fillCombobox: no option matched "${targetValue}"`);
+}
+
+// Workday option handlers often need a full pointer/mouse event sequence
+// rather than just `.click()`. Synthetic .click() events have
+// isTrusted=false and may be ignored by handlers that distinguish real
+// user input.
+function dispatchClickSequence(el: HTMLElement | Element): void {
+  const opts: PointerEventInit & MouseEventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    button: 0,
+  };
+  el.dispatchEvent(new PointerEvent('pointerdown', opts));
+  el.dispatchEvent(new MouseEvent('mousedown', opts));
+  el.dispatchEvent(new PointerEvent('pointerup', opts));
+  el.dispatchEvent(new MouseEvent('mouseup', opts));
+  el.dispatchEvent(new MouseEvent('click', opts));
+}
+
+// Strip parenthetical suffixes ("United States of America (+1)" → "United States of America")
+// so search can fall back to a cleaner version when Workday's option text
+// doesn't include the suffix that the chip displays.
+function searchVariants(targetValue: string): string[] {
+  const variants = new Set<string>();
+  variants.add(targetValue);
+  const stripped = targetValue.replace(/\s*\([^)]*\)\s*/g, '').trim();
+  if (stripped) variants.add(stripped);
+  const firstChunk = targetValue.split(/[(,]/)[0].trim();
+  if (firstChunk) variants.add(firstChunk);
+  return Array.from(variants);
+}
+
+function findOptionMatchInLatestListbox(targetValue: string): HTMLElement | null {
+  const listboxes = document.querySelectorAll('[role="listbox"]');
+  if (listboxes.length === 0) return null;
+  const listbox = listboxes[listboxes.length - 1];
+  const options = Array.from(listbox.querySelectorAll('[role="option"]'));
+  if (options.length === 0) return null;
+
+  // Try each search variant: exact match wins, then substring.
+  for (const variant of searchVariants(targetValue)) {
+    const v = variant.toLowerCase();
+    for (const opt of options) {
+      if (opt.textContent?.trim().toLowerCase() === v) return opt as HTMLElement;
+    }
+  }
+  for (const variant of searchVariants(targetValue)) {
+    const v = variant.toLowerCase();
+    for (const opt of options) {
+      if (opt.textContent?.trim().toLowerCase().includes(v)) return opt as HTMLElement;
+    }
+  }
+  return null;
+}
+
+function setInputValueViaProto(el: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  if (setter) {
+    setter.call(el, value);
+  } else {
+    el.value = value;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function waitForElement(selector: string, timeoutMs = 2000): Promise<Element | null> {
