@@ -337,9 +337,16 @@ async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string
 // Workday's combobox typeahead is finicky:
 //   - Needs a click to open the listbox (focus alone isn't enough)
 //   - Listbox closes if the input dispatches `blur` mid-flow
-//   - Workday filters on `input` events but may need a moment to render
-//   - Sometimes the option you want is in the initial unfiltered list, so
-//     we should look for it before typing
+//   - The filter handler appears to listen on keystroke events; setting
+//     the whole value and dispatching a single `input` event leaves the
+//     listbox unfiltered (verified via diagnostic — listbox stayed on
+//     A–B countries after we'd "typed" the full target value)
+//   - Lists may be virtualized/lazy-loaded — only ~23 options visible
+//     at a time, so we have to filter to surface the option we want
+//   - Option text often differs from the chip text (chip "United States
+//     of America (+1)" → option "United States (+1)"); strip
+//     parenthetical suffix from the filter query, but keep the original
+//     captured value as a search variant for matching after filter
 async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<void> {
   // Step 1: open the dropdown via full click sequence (synthetic .click()
   // alone may not register with Workday's pointer-event handlers).
@@ -355,13 +362,14 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
     return;
   }
 
-  // Step 3: type to filter. Set value via prototype + dispatch input/change
-  // ONLY (no blur — that'd close the listbox).
-  setInputValueViaProto(inputEl, targetValue);
-  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-  inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+  // Step 3: type a filter query character-by-character so Workday's
+  // keystroke-listening filter fires.
+  const filterQuery = filterQueryFor(targetValue);
+  console.log(`[WorkdayAgent] fillCombobox: typing filter "${filterQuery}" for target "${targetValue}"`);
+  await typeIntoCombobox(inputEl, filterQuery);
 
-  // Step 4: give Workday up to 1.5s to filter, polling for a match.
+  // Step 4: give Workday up to 1.5s after typing finishes to render the
+  // filtered list, polling for a match against any search variant.
   for (let i = 0; i < 6; i++) {
     await sleep(250);
     match = findOptionMatchInLatestListbox(targetValue);
@@ -373,6 +381,67 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   }
 
   logListboxMismatch('fillCombobox', targetValue);
+}
+
+// Build a SHORT filter query from the captured value. Workday's combobox
+// option text often differs from the chip text — chip "United States of
+// America (+1)" vs option "United States (+1)". Filtering by the full
+// chip text matches zero options and Workday reverts to the unfiltered
+// alphabetical first page. Trim heuristic:
+//   1. Drop a trailing parenthetical suffix ("(+1)")
+//   2. If multiple words remain, keep only the first 2 (so "United States
+//      of America" → "United States")
+// The full original value is still used for matching options after
+// filter via searchVariants.
+function filterQueryFor(targetValue: string): string {
+  let q = targetValue.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  if (!q) return targetValue;
+  const words = q.split(/\s+/);
+  if (words.length > 2) q = words.slice(0, 2).join(' ');
+  return q;
+}
+
+// Simulate per-character typing so Workday's combobox filter fires.
+// Setting the whole value via prototype + dispatching `input` once isn't
+// enough. Each char fires keydown → beforeinput → input → keyup.
+async function typeIntoCombobox(el: HTMLInputElement, text: string): Promise<void> {
+  // Clear any prior value first.
+  setInputValueViaProto(el, '');
+  el.dispatchEvent(
+    new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }),
+  );
+  await sleep(30);
+
+  let current = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const keyInit: KeyboardEventInit = {
+      key: ch,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    };
+    el.dispatchEvent(new KeyboardEvent('keydown', keyInit));
+    el.dispatchEvent(
+      new InputEvent('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        data: ch,
+        inputType: 'insertText',
+      }),
+    );
+    current += ch;
+    setInputValueViaProto(el, current);
+    el.dispatchEvent(
+      new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }),
+    );
+    el.dispatchEvent(new KeyboardEvent('keyup', keyInit));
+    await sleep(20);
+  }
+
+  // Diagnostic: confirm the input's value reflects what we typed (debugging
+  // whether typing is the gap, or whether filter just isn't firing).
+  console.log(`[WorkdayAgent] typeIntoCombobox: input value after typing is "${el.value}"`);
 }
 
 // Dump the actual options visible in the latest listbox when a match fails,
