@@ -30,6 +30,7 @@
 
 import type { UserProfile, CustomAnswer } from './types';
 import { findMapping, type MappingInput } from './mapping';
+import { requestComboboxFill, requestFiberInspect } from '../injected/bridge';
 
 export interface FillField extends MappingInput {
   tagName: string;
@@ -379,18 +380,17 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   const hierarchical = await tryHierarchicalSelect(targetValue);
   if (hierarchical) return true;
 
-  // Step 3: type a filter query character-by-character so Workday's
-  // keystroke-listening filter fires (NOTE: as of v0.0.8 this does not
-  // actually trigger Workday's React filter — kept here as the v2 entry
-  // point once the injected-script architecture lands).
+  // Step 3: type a filter query character-by-character (legacy v1 path).
+  // As of v0.0.8 this does not actually trigger Workday's React filter
+  // — kept for forward-compat in case Workday changes filter wiring or
+  // a different tenant responds differently.
   const filterQuery = filterQueryFor(targetValue);
   console.log(`[WorkdayAgent] fillCombobox: typing filter "${filterQuery}" for target "${targetValue}"`);
   await typeIntoCombobox(inputEl, filterQuery);
 
-  // Step 4: give Workday up to 1.5s after typing finishes to render the
-  // filtered list, polling for a match against any search variant.
-  for (let i = 0; i < 6; i++) {
-    await sleep(250);
+  // Step 4: short poll for the filtered list to populate from typing.
+  for (let i = 0; i < 4; i++) {
+    await sleep(150);
     match = findOptionMatchInLatestListbox(targetValue);
     if (match) {
       console.log(`[WorkdayAgent] fillCombobox: clicking filtered match for "${targetValue}":`, match.textContent?.trim());
@@ -399,8 +399,72 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
     }
   }
 
+  // Step 5 (v2 path): delegate to the main-world injected script. It can
+  // see React fibers and invoke the combobox's React handler directly,
+  // which the content-script's synthetic DOM events can't reach.
+  const mainWorldOk = await tryMainWorldFill(inputEl, targetValue);
+  if (mainWorldOk) return true;
+
   logListboxMismatch('fillCombobox', targetValue);
   return false;
+}
+
+async function tryMainWorldFill(
+  inputEl: HTMLInputElement,
+  targetValue: string,
+): Promise<boolean> {
+  const selector = buildSelectorForElement(inputEl);
+  if (!selector) {
+    console.log('[WorkdayAgent] tryMainWorldFill: could not build a stable selector for element');
+    return false;
+  }
+
+  // First-run mode: also send a fiber-inspect so the page console shows
+  // what handler props are visible on the element's ancestors. Free
+  // debugging data on every attempt — costs almost nothing.
+  try {
+    const inspect = await requestFiberInspect(selector);
+    console.log('[WorkdayAgent] fiber-inspect result:', inspect);
+  } catch (err) {
+    console.log(
+      '[WorkdayAgent] fiber-inspect failed (main-world script may not be loaded):',
+      (err as Error).message,
+    );
+    // Don't return false — still try the fill. If the fill itself
+    // times out, we'll know main world isn't responsive.
+  }
+
+  try {
+    const variants = searchVariants(targetValue);
+    const response = await requestComboboxFill(selector, targetValue, variants);
+    console.log('[WorkdayAgent] main-world combobox-fill response:', response);
+    return response.status === 'filled';
+  } catch (err) {
+    console.log('[WorkdayAgent] main-world combobox-fill failed:', (err as Error).message);
+    return false;
+  }
+}
+
+/** Build a CSS selector that resolves the element in the main world.
+ *  Workday combobox inputs always have a unique `data-uxi-element-id`
+ *  in the `selectinput-<uuid>` pattern, so use that when present.
+ *  Otherwise fall back to a tagged data attribute. */
+function buildSelectorForElement(el: HTMLInputElement): string | null {
+  const uxi = el.getAttribute('data-uxi-element-id');
+  if (uxi) return `[data-uxi-element-id="${cssEscape(uxi)}"]`;
+  const id = el.id;
+  if (id) return `#${cssEscape(id)}`;
+  // Last resort: mark the element with a one-shot attribute.
+  const marker = `wa-marker-${Math.random().toString(36).slice(2)}`;
+  el.setAttribute('data-wa-target', marker);
+  return `[data-wa-target="${marker}"]`;
+}
+
+function cssEscape(value: string): string {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(value);
+  }
+  return value.replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`);
 }
 
 // Hierarchical / tree-picker fallback. Workday's "How Did You Hear About
