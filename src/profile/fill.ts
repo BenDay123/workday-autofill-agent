@@ -244,9 +244,13 @@ async function fillByWidget(
       field.uxiElementId?.startsWith('selectinput-') ||
       el.getAttribute('role') === 'combobox'
     ) {
-      await fillCombobox(el as HTMLInputElement, String(value));
-      if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
-      result.filled++;
+      const ok = await fillCombobox(el as HTMLInputElement, String(value));
+      if (ok) {
+        if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
+        result.filled++;
+      } else {
+        result.skipped++;
+      }
       return;
     }
 
@@ -266,9 +270,13 @@ async function fillByWidget(
 
   if (tag === 'button') {
     // Workday's paired button-listbox custom select.
-    await fillButtonWidget(el as HTMLButtonElement, String(value));
-    if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
-    result.filled++;
+    const ok = await fillButtonWidget(el as HTMLButtonElement, String(value));
+    if (ok) {
+      if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
+      result.filled++;
+    } else {
+      result.skipped++;
+    }
     return;
   }
 
@@ -316,22 +324,23 @@ function fillSelect(el: HTMLSelectElement, value: string): void {
   }
 }
 
-async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string): Promise<void> {
+async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string): Promise<boolean> {
   // Open the dropdown with full click sequence.
   dispatchClickSequence(buttonEl);
   const listbox = await waitForElement('[role="listbox"]', 2000);
   if (!listbox) {
     console.log(`[WorkdayAgent] fillButtonWidget: listbox didn't appear for "${targetValue}"`);
-    return;
+    return false;
   }
 
   const match = findOptionMatchInLatestListbox(targetValue);
   if (match) {
     console.log(`[WorkdayAgent] fillButtonWidget: clicking option "${match.textContent?.trim()}" for target "${targetValue}"`);
     dispatchClickSequence(match);
-  } else {
-    logListboxMismatch('fillButtonWidget', targetValue);
+    return true;
   }
+  logListboxMismatch('fillButtonWidget', targetValue);
+  return false;
 }
 
 // Workday's combobox typeahead is finicky:
@@ -347,7 +356,7 @@ async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string
 //     of America (+1)" → option "United States (+1)"); strip
 //     parenthetical suffix from the filter query, but keep the original
 //     captured value as a search variant for matching after filter
-async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<void> {
+async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<boolean> {
   // Step 1: open the dropdown via full click sequence (synthetic .click()
   // alone may not register with Workday's pointer-event handlers).
   dispatchClickSequence(inputEl);
@@ -359,11 +368,21 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   if (match) {
     console.log(`[WorkdayAgent] fillCombobox: clicking unfiltered match for "${targetValue}":`, match.textContent?.trim());
     dispatchClickSequence(match);
-    return;
+    return true;
   }
 
+  // Step 2b: hierarchical fallback — if the listbox is small and none of
+  // the options match, try clicking each top-level option to see if it
+  // expands into a sub-list containing the target (Workday's tree-style
+  // pickers, e.g., "How Did You Hear About Us?" where the top level is
+  // categories and "Internet Advertisement" lives inside "Advertisement").
+  const hierarchical = await tryHierarchicalSelect(targetValue);
+  if (hierarchical) return true;
+
   // Step 3: type a filter query character-by-character so Workday's
-  // keystroke-listening filter fires.
+  // keystroke-listening filter fires (NOTE: as of v0.0.8 this does not
+  // actually trigger Workday's React filter — kept here as the v2 entry
+  // point once the injected-script architecture lands).
   const filterQuery = filterQueryFor(targetValue);
   console.log(`[WorkdayAgent] fillCombobox: typing filter "${filterQuery}" for target "${targetValue}"`);
   await typeIntoCombobox(inputEl, filterQuery);
@@ -376,11 +395,112 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
     if (match) {
       console.log(`[WorkdayAgent] fillCombobox: clicking filtered match for "${targetValue}":`, match.textContent?.trim());
       dispatchClickSequence(match);
-      return;
+      return true;
     }
   }
 
   logListboxMismatch('fillCombobox', targetValue);
+  return false;
+}
+
+// Hierarchical / tree-picker fallback. Workday's "How Did You Hear About
+// Us?" surfaces top-level CATEGORIES ("Advertisement", "Partnership",
+// "Socially", "Website", "Workday") and the user drills in to find leaf
+// options like "Internet Advertisement". This walks each top-level
+// option, clicks it to expand, checks if the latest listbox contains a
+// match for the target, and clicks the match if found. Backs out if
+// no match by clicking the category again (to collapse) before moving
+// to the next.
+async function tryHierarchicalSelect(targetValue: string): Promise<boolean> {
+  const listboxes = document.querySelectorAll('[role="listbox"]');
+  if (listboxes.length === 0) return false;
+  const listbox = listboxes[listboxes.length - 1];
+  const topLevelOptions = Array.from(
+    listbox.querySelectorAll('[role="option"]'),
+  ) as HTMLElement[];
+  if (topLevelOptions.length === 0 || topLevelOptions.length > 10) {
+    // Tree pickers in practice have few top-level categories. If the list
+    // is large, it's a flat list (or paginated) and hierarchical walking
+    // would just be noisy and slow.
+    return false;
+  }
+
+  // Snapshot the initial option labels so we can detect when clicking a
+  // category replaces them (vs. expanding inline).
+  const initialLabels = new Set(
+    topLevelOptions.map((o) => o.textContent?.trim() ?? ''),
+  );
+  console.log(
+    `[WorkdayAgent] tryHierarchicalSelect: attempting drill-in for "${targetValue}" across ${topLevelOptions.length} categories: ${JSON.stringify(Array.from(initialLabels))}`,
+  );
+
+  for (const category of topLevelOptions) {
+    const categoryLabel = category.textContent?.trim() ?? '';
+    // Heuristic: prioritize the category whose name is a prefix/substring
+    // of the target. "Internet Advertisement" → try "Advertisement" first.
+    // We'll still walk the rest if the prioritized one doesn't yield.
+    // (Implemented below as a re-sort.)
+    void categoryLabel; // silence unused warning in current pass
+  }
+
+  // Sort: categories whose name appears as a token in the target come first.
+  const targetTokens = targetValue.toLowerCase().split(/\s+/);
+  topLevelOptions.sort((a, b) => {
+    const al = (a.textContent ?? '').toLowerCase().trim();
+    const bl = (b.textContent ?? '').toLowerCase().trim();
+    const aMatch = targetTokens.some((t) => t === al || al.includes(t) || t.includes(al));
+    const bMatch = targetTokens.some((t) => t === bl || bl.includes(t) || t.includes(bl));
+    return (bMatch ? 1 : 0) - (aMatch ? 1 : 0);
+  });
+
+  for (const category of topLevelOptions) {
+    const categoryLabel = category.textContent?.trim() ?? '';
+    console.log(`[WorkdayAgent] tryHierarchicalSelect: clicking category "${categoryLabel}"`);
+    dispatchClickSequence(category);
+    await sleep(300);
+
+    const match = findOptionMatchInLatestListbox(targetValue);
+    if (match) {
+      const matchLabel = match.textContent?.trim() ?? '';
+      // Don't re-click the same category we just opened (matches by self).
+      if (matchLabel === categoryLabel) {
+        // continue to back-out below
+      } else {
+        console.log(`[WorkdayAgent] tryHierarchicalSelect: matched "${matchLabel}" under "${categoryLabel}"`);
+        dispatchClickSequence(match);
+        return true;
+      }
+    }
+
+    // No match under this category. Back out so the next category is
+    // reachable. If the listbox went back to the same top-level labels,
+    // the category click toggled rather than drilled — don't re-click
+    // (would re-expand). Otherwise click the category again to collapse.
+    const currentListboxes = document.querySelectorAll('[role="listbox"]');
+    if (currentListboxes.length === 0) {
+      console.log(`[WorkdayAgent] tryHierarchicalSelect: listbox closed after clicking "${categoryLabel}"; aborting`);
+      return false;
+    }
+    const currentLabels = new Set(
+      Array.from(
+        currentListboxes[currentListboxes.length - 1].querySelectorAll('[role="option"]'),
+      ).map((o) => o.textContent?.trim() ?? ''),
+    );
+    const stillAtTopLevel = setsEqual(currentLabels, initialLabels);
+    if (!stillAtTopLevel) {
+      // Drilled into a sub-list — click the category again to back out.
+      dispatchClickSequence(category);
+      await sleep(200);
+    }
+  }
+
+  return false;
+}
+
+function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
 }
 
 // Build a SHORT filter query from the captured value. Workday's combobox
