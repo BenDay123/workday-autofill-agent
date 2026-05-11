@@ -76,7 +76,7 @@ const SKIP_HANDLER_DEPTHS = new Set([0, 1]);
 // ---- Boot ----
 
 console.log(
-  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.12)`,
+  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.13)`,
 );
 
 window.addEventListener('message', onMessage);
@@ -294,11 +294,11 @@ function handleComboboxFill(req: ComboboxFillRequest): void {
     return;
   }
 
-  // Give the React filter a moment to render, then scan the latest
-  // listbox for matches against any search variant.
+  // Give the React filter a moment to render, then scan the listbox
+  // associated with THIS input for matches against any search variant.
   void owner; // silence unused — we'll need it for hierarchical phase 6b
   setTimeout(() => {
-    const matchResult = findOptionMatch(req.searchVariants);
+    const matchResult = findOptionMatch(req.searchVariants, el);
     if (matchResult.option) {
       dispatchClickSequence(matchResult.option);
       respond<ComboboxFillResponse>({
@@ -377,15 +377,18 @@ function typeName(fiber: Fiber): string {
 
 // ---- Listbox option matching (mirrors content-script logic for v2 path) ----
 
-function findOptionMatch(searchVariants: string[]): {
+function findOptionMatch(
+  searchVariants: string[],
+  sourceInput: HTMLElement,
+): {
   option: HTMLElement | null;
   optionsSeen: string[];
 } {
-  const listboxes = document.querySelectorAll('[role="listbox"]');
-  if (listboxes.length === 0) {
+  const listbox = findListboxFor(sourceInput);
+  if (!listbox) {
+    console.log('[WorkdayAgent main-world] findOptionMatch: no listbox found for input');
     return { option: null, optionsSeen: [] };
   }
-  const listbox = listboxes[listboxes.length - 1];
   const options = Array.from(listbox.querySelectorAll('[role="option"]')) as HTMLElement[];
   const optionsSeen = options.map((o) => o.textContent?.trim() ?? '');
 
@@ -402,6 +405,100 @@ function findOptionMatch(searchVariants: string[]): {
     }
   }
   return { option: null, optionsSeen };
+}
+
+// Find the listbox associated with a specific input element. Workday
+// pre-renders multiple listboxes (chip indicators, hidden popups, etc.)
+// so "latest in DOM order" is unreliable. Priority:
+//   1) Input's aria-controls / aria-owns points to an explicit listbox id
+//   2) Visible (bounding rect > 0, not aria-hidden) listbox nearest to
+//      the input in DOM tree
+//   3) Most-recent visible listbox with > 1 option
+//   4) Last resort: latest listbox in DOM order
+function findListboxFor(input: HTMLElement): Element | null {
+  // 1) Explicit ARIA reference
+  for (const attr of ['aria-controls', 'aria-owns', 'aria-activedescendant']) {
+    const id = input.getAttribute(attr);
+    if (id) {
+      // aria-activedescendant points to an OPTION; walk up to find its listbox.
+      const referenced = document.getElementById(id);
+      if (referenced) {
+        if (referenced.getAttribute('role') === 'listbox') {
+          console.log(`[WorkdayAgent main-world] findListboxFor: matched via ${attr}=#${id}`);
+          return referenced;
+        }
+        const ancestor = referenced.closest('[role="listbox"]');
+        if (ancestor) {
+          console.log(`[WorkdayAgent main-world] findListboxFor: matched via ${attr}=#${id} → ancestor listbox`);
+          return ancestor;
+        }
+      }
+    }
+  }
+
+  // 2-3) Visible, multi-option listbox(es)
+  const all = Array.from(document.querySelectorAll('[role="listbox"]'));
+  const visibleMulti = all.filter((lb) => {
+    if (lb.getAttribute('aria-hidden') === 'true') return false;
+    const rect = lb.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+    return lb.querySelectorAll('[role="option"]').length > 1;
+  });
+
+  if (visibleMulti.length === 1) {
+    console.log('[WorkdayAgent main-world] findListboxFor: matched the sole visible multi-option listbox');
+    return visibleMulti[0];
+  }
+  if (visibleMulti.length > 1) {
+    // Prefer the listbox nearest the input in the DOM tree.
+    let best: Element | null = null;
+    let bestDistance = Infinity;
+    for (const lb of visibleMulti) {
+      const distance = domDistance(input, lb);
+      if (distance < bestDistance) {
+        best = lb;
+        bestDistance = distance;
+      }
+    }
+    if (best) {
+      console.log(
+        `[WorkdayAgent main-world] findListboxFor: matched nearest visible multi-option listbox (distance=${bestDistance})`,
+      );
+      return best;
+    }
+  }
+
+  // 4) Last resort
+  if (all.length > 0) {
+    console.log(
+      `[WorkdayAgent main-world] findListboxFor: falling back to latest-in-DOM-order listbox (no visible multi-option candidates)`,
+    );
+    return all[all.length - 1];
+  }
+  return null;
+}
+
+// DOM tree distance: number of "up" steps from `a` until an ancestor
+// contains `b`, plus number of "down" steps to reach `b`. Cheap proxy
+// for "is this listbox part of the same widget as my input?"
+function domDistance(a: Element, b: Element): number {
+  let depth = 0;
+  let current: Element | null = a;
+  while (current) {
+    if (current.contains(b)) {
+      // Now count downward from `current` to `b`.
+      let down = 0;
+      let cursor: Element | null = b;
+      while (cursor && cursor !== current) {
+        cursor = cursor.parentElement;
+        down++;
+      }
+      return depth + down;
+    }
+    current = current.parentElement;
+    depth++;
+  }
+  return Number.POSITIVE_INFINITY;
 }
 
 function dispatchClickSequence(el: HTMLElement | Element): void {

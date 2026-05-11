@@ -334,7 +334,7 @@ async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string
     return false;
   }
 
-  const match = findOptionMatchInLatestListbox(targetValue);
+  const match = findOptionMatchInLatestListbox(targetValue, buttonEl);
   if (match) {
     console.log(`[WorkdayAgent] fillButtonWidget: clicking option "${match.textContent?.trim()}" for target "${targetValue}"`);
     dispatchClickSequence(match);
@@ -374,7 +374,7 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   await sleep(150);
 
   // Step 2: try matching against the initial (unfiltered) listbox first.
-  let match = findOptionMatchInLatestListbox(targetValue);
+  let match = findOptionMatchInLatestListbox(targetValue, inputEl);
   if (match) {
     console.log(`[WorkdayAgent] fillCombobox: clicking unfiltered match for "${targetValue}":`, match.textContent?.trim());
     dispatchClickSequence(match);
@@ -386,7 +386,7 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   // expands into a sub-list containing the target (Workday's tree-style
   // pickers, e.g., "How Did You Hear About Us?" where the top level is
   // categories and "Internet Advertisement" lives inside "Advertisement").
-  const hierarchical = await tryHierarchicalSelect(targetValue);
+  const hierarchical = await tryHierarchicalSelect(targetValue, inputEl);
   if (hierarchical) return true;
 
   // Step 3: type a filter query character-by-character (legacy v1 path).
@@ -400,7 +400,7 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   // Step 4: short poll for the filtered list to populate from typing.
   for (let i = 0; i < 4; i++) {
     await sleep(150);
-    match = findOptionMatchInLatestListbox(targetValue);
+    match = findOptionMatchInLatestListbox(targetValue, inputEl);
     if (match) {
       console.log(`[WorkdayAgent] fillCombobox: clicking filtered match for "${targetValue}":`, match.textContent?.trim());
       dispatchClickSequence(match);
@@ -492,10 +492,12 @@ function cssEscape(value: string): string {
 // match for the target, and clicks the match if found. Backs out if
 // no match by clicking the category again (to collapse) before moving
 // to the next.
-async function tryHierarchicalSelect(targetValue: string): Promise<boolean> {
-  const listboxes = document.querySelectorAll('[role="listbox"]');
-  if (listboxes.length === 0) return false;
-  const listbox = listboxes[listboxes.length - 1];
+async function tryHierarchicalSelect(
+  targetValue: string,
+  sourceEl: Element,
+): Promise<boolean> {
+  const listbox = findListboxFor(sourceEl);
+  if (!listbox) return false;
   const topLevelOptions = Array.from(
     listbox.querySelectorAll('[role="option"]'),
   ) as HTMLElement[];
@@ -540,21 +542,20 @@ async function tryHierarchicalSelect(targetValue: string): Promise<boolean> {
     dispatchClickSequence(category);
     await sleep(300);
 
-    const match = findOptionMatchInLatestListbox(targetValue);
+    const match = findOptionMatchInLatestListbox(targetValue, sourceEl);
     if (match) {
       const matchLabel = match.textContent?.trim() ?? '';
-      // After clicking the category, the latest listbox in DOM order
-      // might be a single-option chip-indicator from an UNRELATED
-      // widget (e.g., country-phone-code chip showing "United States
-      // of America (+1)") rather than a real drill-in result. Require:
+      // After clicking the category, the listbox we now read should be
+      // associated with our sourceEl. If the click had a side effect on
+      // an unrelated widget, the lookup might find a different listbox
+      // — require:
       //   1) the match isn't the category itself
       //   2) the match wasn't already in the top-level option set
       //   3) the listbox containing the match has multiple options
       //      (real drill-down sub-lists do, single-option indicators
       //      don't)
       //   4) the listbox is NOT our original top-level listbox
-      const listboxes = document.querySelectorAll('[role="listbox"]');
-      const currentListbox = listboxes[listboxes.length - 1] ?? null;
+      const currentListbox = findListboxFor(sourceEl);
       const optionCount = currentListbox
         ? currentListbox.querySelectorAll('[role="option"]').length
         : 0;
@@ -583,15 +584,15 @@ async function tryHierarchicalSelect(targetValue: string): Promise<boolean> {
     // reachable. If the listbox went back to the same top-level labels,
     // the category click toggled rather than drilled — don't re-click
     // (would re-expand). Otherwise click the category again to collapse.
-    const currentListboxes = document.querySelectorAll('[role="listbox"]');
-    if (currentListboxes.length === 0) {
+    const stillVisible = findListboxFor(sourceEl);
+    if (!stillVisible) {
       console.log(`[WorkdayAgent] tryHierarchicalSelect: listbox closed after clicking "${categoryLabel}"; aborting`);
       return false;
     }
     const currentLabels = new Set(
-      Array.from(
-        currentListboxes[currentListboxes.length - 1].querySelectorAll('[role="option"]'),
-      ).map((o) => o.textContent?.trim() ?? ''),
+      Array.from(stillVisible.querySelectorAll('[role="option"]')).map(
+        (o) => o.textContent?.trim() ?? '',
+      ),
     );
     const stillAtTopLevel = setsEqual(currentLabels, initialLabels);
     if (!stillAtTopLevel) {
@@ -725,10 +726,12 @@ function searchVariants(targetValue: string): string[] {
   return Array.from(variants);
 }
 
-function findOptionMatchInLatestListbox(targetValue: string): HTMLElement | null {
-  const listboxes = document.querySelectorAll('[role="listbox"]');
-  if (listboxes.length === 0) return null;
-  const listbox = listboxes[listboxes.length - 1];
+function findOptionMatchInLatestListbox(
+  targetValue: string,
+  sourceEl?: Element,
+): HTMLElement | null {
+  const listbox = sourceEl ? findListboxFor(sourceEl) : latestListbox();
+  if (!listbox) return null;
   const options = Array.from(listbox.querySelectorAll('[role="option"]'));
   if (options.length === 0) return null;
 
@@ -746,6 +749,71 @@ function findOptionMatchInLatestListbox(targetValue: string): HTMLElement | null
     }
   }
   return null;
+}
+
+function latestListbox(): Element | null {
+  const all = document.querySelectorAll('[role="listbox"]');
+  return all.length > 0 ? all[all.length - 1] : null;
+}
+
+// Mirror of main.ts findListboxFor. See that file for the full rationale.
+// Workday pre-renders multiple listboxes; "latest in DOM order" gives the
+// wrong one when filling combobox A while combobox B's chip indicator
+// happens to be later in the DOM.
+function findListboxFor(input: Element): Element | null {
+  for (const attr of ['aria-controls', 'aria-owns', 'aria-activedescendant']) {
+    const id = input.getAttribute(attr);
+    if (id) {
+      const referenced = document.getElementById(id);
+      if (referenced) {
+        if (referenced.getAttribute('role') === 'listbox') return referenced;
+        const ancestor = referenced.closest('[role="listbox"]');
+        if (ancestor) return ancestor;
+      }
+    }
+  }
+
+  const all = Array.from(document.querySelectorAll('[role="listbox"]'));
+  const visibleMulti = all.filter((lb) => {
+    if (lb.getAttribute('aria-hidden') === 'true') return false;
+    const rect = lb.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+    return lb.querySelectorAll('[role="option"]').length > 1;
+  });
+
+  if (visibleMulti.length === 1) return visibleMulti[0];
+  if (visibleMulti.length > 1) {
+    let best: Element | null = null;
+    let bestDistance = Infinity;
+    for (const lb of visibleMulti) {
+      const d = domDistance(input, lb);
+      if (d < bestDistance) {
+        best = lb;
+        bestDistance = d;
+      }
+    }
+    if (best) return best;
+  }
+  return all.length > 0 ? all[all.length - 1] : null;
+}
+
+function domDistance(a: Element, b: Element): number {
+  let depth = 0;
+  let current: Element | null = a;
+  while (current) {
+    if (current.contains(b)) {
+      let down = 0;
+      let cursor: Element | null = b;
+      while (cursor && cursor !== current) {
+        cursor = cursor.parentElement;
+        down++;
+      }
+      return depth + down;
+    }
+    current = current.parentElement;
+    depth++;
+  }
+  return Number.POSITIVE_INFINITY;
 }
 
 function setInputValueViaProto(el: HTMLInputElement, value: string): void {
