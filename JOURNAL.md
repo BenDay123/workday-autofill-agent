@@ -121,6 +121,105 @@ CLAUDE.md as the explicit v1/v2 boundary.
   is the next concrete step — captures the v1 win and the v2 backlog
   honestly.
 
+**Same-day autonomous chunk (Ben away from keyboard):**
+
+Ben handed me the keyboard with "spin up agents if needed, less involvement
+by me." I shipped two more commits autonomously, plus a planning sub-agent.
+
+What I built:
+
+1. **v0.0.9 — content-script-only follow-ups.** Two fixes that didn't
+   need the v2 architecture. (a) Hierarchical fallback in fillCombobox:
+   when the flat-list match fails and the listbox has ≤10 options, treat
+   it as a tree picker. Walk each top-level option, click to expand,
+   check the latest listbox for a match. Prioritize categories whose
+   name appears in the target value ("Internet Advertisement" → try
+   "Advertisement" first). Backs out cleanly when no match. (b) Fixed
+   the result counting: fillCombobox and fillButtonWidget now return
+   booleans; the fill loop counts skipped vs filled correctly. Previous
+   "15 filled, 2 skipped" lines were overstating success by treating
+   combobox failures as successes.
+
+2. **v0.0.10 — v2 architecture scaffolding.** Three new files under
+   src/injected/:
+   - `protocol.ts` — types only, shared between worlds. Two request
+     kinds: `fiber-inspect` (diagnostic, no mutation) and
+     `combobox-fill` (the real path). Namespaced `'wa-v2'` so unrelated
+     page postMessage chatter doesn't collide.
+   - `main.ts` — the main-world script. Walks React fibers from a
+     target element, finds an ancestor with a handler matching the
+     `CANDIDATE_HANDLER_NAMES` allowlist (onChange, onInputChange,
+     onFilterChange, onSearch, etc.), uses the native value setter,
+     invokes the handler with a synthetic React-shaped event, scans
+     the resulting listbox for matches, clicks one. Reports rich
+     diagnostics back: handler name found, ancestor depth, options
+     seen, chosen option, error message.
+   - `bridge.ts` — content-script-side postMessage helpers with
+     request-id correlation and 4s timeout.
+   - `vite.config.ts` updated: second content_scripts entry with
+     `world: 'MAIN' run_at: 'document_start'`. @crxjs/vite-plugin
+     supports this directly. Manifest output verified clean — both
+     scripts non-zero, web_accessible_resources lists the bundled
+     main and protocol modules.
+
+Designed the whole thing diagnostic-first. Every combobox fill attempt
+sends a fiber-inspect FIRST and logs the response — so the first time
+Ben tests this live, the page console shows every on-prefixed prop
+visible on the combobox's ancestor fibers. That data drives whether
+the allowlist needs new entries (e.g., if Workday uses a Workday-
+specific name like `onWdComboboxChange`).
+
+I learned something useful by spawning the Plan agent: it called out
+that Step 1 of the v2 architecture is a DevTools spike on a live
+Workday page — which only Ben can do. So I designed around that by
+making the first run itself the spike. The fiber-inspect path is
+"what would the spike find?" baked into runtime.
+
+What I deliberately did NOT do:
+
+- Verify any of v0.0.10 on a live Workday page (can't — no browser).
+- Push to remote. Local commits only.
+- Pre-write handler-specific logic. Without seeing Workday's actual
+  React component shape, every guess is a guess. The diagnostic data
+  comes back, then we wire the specific handler.
+
+Known risks Ben should watch for during verification:
+
+- **Main-world script doesn't load at all.** @crxjs/vite-plugin emits
+  it via a loader that uses dynamic `import()`. If Workday's CSP
+  blocks that import, the page console will NOT show the
+  `[WorkdayAgent main-world] injected on ...` startup log. Bridge
+  requests will time out after 4s with "bridge timeout after 4000ms"
+  in the content-script console. Documented fallback: switch to an
+  IIFE-built bundle + manual script-tag injection from content script.
+- **Fiber walks but no handler matches the allowlist.** The
+  fiber-inspect output (logged on every combobox attempt) will show
+  every on-prefixed prop on each ancestor. Pick whichever looks like
+  the filter handler, add it to CANDIDATE_HANDLER_NAMES in
+  src/injected/main.ts, rebuild, retest.
+- **Handler call fires but no filter happens.** Likely a signature
+  mismatch — the handler might take `(value, event)` instead of
+  `(event)`. Rebuild the synthetic event shape based on what Workday's
+  expecting; sometimes that's revealed by reading the handler's
+  function body via `handler.toString()` in DevTools.
+- **Handler signature is fine but listbox doesn't match.** Means
+  Workday's filter ran and excluded the target. Different problem
+  (back to existing searchVariants logic in content-script-side
+  findOptionMatchInLatestListbox).
+
+Each of those failure modes has a clear next action and the diagnostics
+should pinpoint which one we're in. Worst case, v0.0.10 turns out to
+need a different bundling strategy and we revert to v0.0.9's known-good
+state.
+
+Build state at this handoff:
+- Local commits only: v0.0.9 c0d29e2, v0.0.10 7468c58 (plus the v0.0.8
+  iteration and docs commit already on main from this morning).
+- `npm run build` clean. `npx tsc --noEmit` clean.
+- One warning, expected: `[crx:content-scripts] Some content-scripts
+  don't support HMR because the world is MAIN: /src/injected/main.ts`.
+  This is documented behavior, not a build failure.
+
 
 
 Got Path A live in the morning — tightened detection so the scanner stops
@@ -442,7 +541,7 @@ Slow down and read the output.
 
 **Working name:** `workday-autofill-agent` (GitHub repo) / "WorkdayAgent" (referential)
 **Started:** May 2026
-**Status:** v0.0.8 — verified end-to-end on contact-info step at 13/15 fields filled (87%). Text inputs, button widgets (Country / State / Phone Device Type), radios, checkboxes, and customAnswers all work. Bug 1 (merge architecture) fixed in v0.0.6: capture now records granular touched paths and `mergeWithExisting` applies only those, so a single-field capture no longer wipes sibling fields in the same section. Bug 2 (combobox typeahead) explicitly deferred to v2: diagnostic in v0.0.7 surfaced two distinct failures (hierarchical source dropdown and alphabetical-paginated phone code), and the typing iteration in v0.0.8 proved the gap isn't in our value-setting (verified `el.value` reads back correctly after typing) but in Workday's React filter handler not responding to synthetic DOM events. Real fix needs the two-script (content + injected) architecture documented in CLAUDE.md.
+**Status:** v0.0.10 — v1 baseline verified end-to-end on contact-info step at 13/15 fields filled (87%, last verified at v0.0.8). Text inputs, button widgets (Country / State / Phone Device Type), radios, checkboxes, and customAnswers all work. Bug 1 (merge architecture) fixed in v0.0.6 and verified live: capture now records granular touched paths and `mergeWithExisting` applies only those. v0.0.9 added a content-script-only hierarchical click-walking fallback for tree-style comboboxes (e.g., "How Did You Hear About Us?") and fixed result counting so failed combobox fills count as `skipped` not `filled`. v0.0.10 shipped the v2 architecture scaffold (main-world injected script + content↔main bridge under `src/injected/`), built diagnostic-first so the first live run produces the React fiber data needed to refine the handler allowlist. Neither v0.0.9 nor v0.0.10 has been verified on a live Workday page yet — that's the next concrete step.
 
 ## What this is
 
@@ -841,6 +940,12 @@ the manifest paths have changed.
 - Locked profile data model decisions (see "Architectural decisions made so far" in CLAUDE.md and the data-model section in this entry).
 - Wrapped session here with architecture in hand, ready for implementation work next time.
 
+### Session 7.8 — Autonomous chunk: hierarchical fallback + v2 scaffolding
+- Ben handed me the keyboard (literally: "spin up agents if needed, less involvement by me"). I shipped v0.0.9 and v0.0.10 unattended, spawned one Plan sub-agent for the v2 architecture, kept commits local only.
+- v0.0.9: hierarchical click-walking fallback in fillCombobox (handles tree-style pickers like "How Did You Hear About Us?" content-script-only), plus correct skipped-vs-filled counting (failed combobox attempts no longer count as success). Both deferred from session 7.7 as content-script-only wins.
+- v0.0.10: v2 architecture scaffolding. New `src/injected/{protocol.ts,main.ts,bridge.ts}`. The main-world script walks React fibers from a combobox input, finds the first ancestor with a callable handler matching a CANDIDATE_HANDLER_NAMES allowlist, invokes it with a synthetic React-shaped event after using the native value setter. Content↔main routing via window.postMessage with a 4-second timeout. The Plan sub-agent flagged that step 1 of the v2 work is a DevTools spike only Ben can do — so I designed the scaffold diagnostic-first: every combobox fill attempt also sends a fiber-inspect that logs every on-prefixed prop on the ancestor fibers. First live run produces the spike data; we refine the allowlist (or other handler logic) from that.
+- @crxjs/vite-plugin supports `world: 'MAIN'` directly in the second content_scripts entry. Build clean. One known residual unknown: the plugin emits the main-world script as a loader that uses dynamic `import()`. Whether that works under Workday's CSP isn't testable without a live page. Documented fallback (IIFE bundle + manual script-tag injection) noted in CLAUDE.md.
+
 ### Session 7.7 — Path-level merge, combobox diagnostic, hit the v1/v2 wall
 - Bug 1 (merge architecture): replaced section-level `mergeWithExisting` with granular path-level merge. CaptureResult now records every touched dotted path; object leaves get deep-set, array sections get replaced wholesale, keyed entries (websites, customAnswers) match-replace-or-append. Verified end-to-end: captured `preferences.preferredSource = "Internet Advertisement"` from contact-info, then captured Application Questions (touches `preferences.willingToRelocate`), preferredSource survived. Shipped as v0.0.6.
 - Bug 2 (combobox typing): built a listbox-mismatch diagnostic that dumps actual option labels on match failure. Immediately surfaced two distinct combobox failures — Source dropdown is hierarchical (5 categories at top level, "Internet Advertisement" lives inside "Advertisement"), Phone Code is alphabetical and lazy-loaded (~200 countries, only 23 rendered). Shipped diagnostic as v0.0.7.
@@ -849,7 +954,11 @@ the manifest paths have changed.
 - End-state on contact-info step: 13/15 fields filled (87%). All fail-cases are Workday combobox typeaheads.
 
 ### Tomorrow / next session
-- Decide whether v1 is "done enough" for the LinkedIn post. With 13/15 fill on contact-info (and identity / contact / work experience / education / radio Q&A all working), this is already a demo-able result. The combobox gap is itself a narrated lesson worth telling.
+- **Verify v0.0.10 on a live Workday page (smallest first step).** Load the new build, open the page console (NOT the extension console — main-world logs appear there), click "Fill from Profile" on a step with a combobox. Three things to look for:
+  1. `[WorkdayAgent main-world] injected on ...` startup log at page load. If absent, the dynamic-import-from-MAIN-world issue is real and we need the IIFE/script-tag fallback.
+  2. `fiber-inspect result:` log on each combobox attempt, showing ancestors with their `handlerPropNames`. Copy/paste this back to Claude — the real Workday handler name(s) probably need to land in `CANDIDATE_HANDLER_NAMES`.
+  3. `main-world combobox-fill response:` log with status and diagnostics. Reveals whether the handler invocation actually filtered the list or not.
+- Verify v0.0.9's hierarchical fallback on the source dropdown ("How Did You Hear About Us?"). Walk-and-click logs should show each top-level category being tried, with "Internet Advertisement" found inside one of them.
+- Decide whether v1 is "done enough" for the LinkedIn post. With 13/15 fill (and identity / contact / work experience / education / radio Q&A all working), this is already a demo-able result. The combobox gap is itself a narrated lesson — and v0.0.10 may close it once we refine the allowlist with real data.
 - Record an end-to-end screen capture on a real Workday application: capture from multiple steps, then fill on a fresh `useMyLastApplication` URL. Document what fills and what doesn't.
-- If continuing into v2 architecture: build the injected-script half (page-main-world execution + content↔injected message passing) and traverse React fibers to invoke combobox handlers directly. Hierarchical click-walking for the source dropdown is also a content-script-only fix worth doing alongside.
-- Defer further: LLM-based semantic mapping for tenants whose label phrasing breaks the regex map. Fresh-start (one-block, click-Add-Another) Workday flows for work experience / education.
+- Defer further: LLM-based semantic mapping for tenants whose label phrasing breaks the regex map. Fresh-start (one-block, click-Add-Another) Workday flows for work experience / education. Skills typeahead chip capture/fill.
