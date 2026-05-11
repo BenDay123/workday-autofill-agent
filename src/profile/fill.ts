@@ -819,7 +819,10 @@ function findListboxFor(input: Element): Element | null {
     }
     if (best) return best;
   }
-  return all.length > 0 ? all[all.length - 1] : null;
+  // No good candidate — don't fall back to latest-in-DOM-order. That
+  // path previously poisoned source-dropdown attempts by matching them
+  // against the country phone code's chip indicator.
+  return null;
 }
 
 function domDistance(a: Element, b: Element): number {

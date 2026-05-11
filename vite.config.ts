@@ -4,7 +4,7 @@ import { crx, defineManifest } from '@crxjs/vite-plugin';
 const manifest = defineManifest({
   manifest_version: 3,
   name: 'WorkdayAgent',
-  version: '0.0.14',
+  version: '0.0.15',
   description: 'Auto-fill Workday job applications. Built in public.',
   permissions: ['storage', 'activeTab', 'clipboardWrite'],
   host_permissions: ['https://*.myworkdayjobs.com/*'],

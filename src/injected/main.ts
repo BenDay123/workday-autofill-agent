@@ -67,6 +67,16 @@ const VALUE_FIRST_HANDLERS = new Set([
   'onValueChange',
 ]);
 
+/** Handlers that should open Workday's combobox listbox. Tried in
+ *  priority order BEFORE the filter handler runs. Plain DOM clicks on
+ *  the input don't always open the listbox when the combobox starts
+ *  empty (Workday gates it through React click handlers higher up). */
+const OPENER_HANDLER_NAMES = [
+  'onSelectInputClick',
+  'onPromptIconClick',
+  'onClick',
+];
+
 /** Fiber depths to skip when looking for the combobox handler. Depths
  *  0–1 are the input element itself and its `Styled(input)` wrapper —
  *  those carry React form-control onChange, not Workday's filter
@@ -76,7 +86,7 @@ const SKIP_HANDLER_DEPTHS = new Set([0, 1]);
 // ---- Boot ----
 
 console.log(
-  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.14)`,
+  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.15)`,
 );
 
 window.addEventListener('message', onMessage);
@@ -230,6 +240,26 @@ function handleComboboxFill(req: ComboboxFillRequest): void {
     return;
   }
 
+  // Phase A: open the listbox via React handlers if it isn't already.
+  // Workday's combobox doesn't always open on a plain DOM click — for
+  // empty fields, the opener gates on a React click handler at depth ~10
+  // (onSelectInputClick / onPromptIconClick). Invoke whichever we find,
+  // then give the listbox a moment to render before filtering.
+  const opener = findOpenerInFiberTree(fiber);
+  if (opener) {
+    console.log(
+      `[WorkdayAgent main-world] invoking opener handler=${opener.name} at depth=${opener.depth}`,
+    );
+    try {
+      const syntheticClick = makeSyntheticMouseEvent(el);
+      opener.handler(syntheticClick);
+    } catch (err) {
+      console.log(
+        `[WorkdayAgent main-world] opener handler ${opener.name} threw: ${(err as Error).message ?? String(err)}`,
+      );
+    }
+  }
+
   // Set the input's value via the native prototype setter and invoke the
   // handler with a synthetic event whose target is the live element.
   // The native setter trick bypasses React's per-instance value tracker
@@ -358,6 +388,48 @@ function findFiberKey(el: Element): string | undefined {
   return Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
 }
 
+function findOpenerInFiberTree(
+  fiber: Fiber | null,
+): { handler: (...args: unknown[]) => unknown; name: string; depth: number } | null {
+  let current: Fiber | null = fiber;
+  let depth = 0;
+  while (current && depth < MAX_FIBER_DEPTH) {
+    if (!SKIP_HANDLER_DEPTHS.has(depth)) {
+      const props = getProps(current);
+      for (const name of OPENER_HANDLER_NAMES) {
+        const candidate = props[name];
+        if (typeof candidate === 'function') {
+          return {
+            handler: candidate as (...args: unknown[]) => unknown,
+            name,
+            depth,
+          };
+        }
+      }
+    }
+    current = current.return ?? null;
+    depth++;
+  }
+  return null;
+}
+
+function makeSyntheticMouseEvent(el: HTMLElement): unknown {
+  return {
+    target: el,
+    currentTarget: el,
+    type: 'click',
+    bubbles: true,
+    cancelable: true,
+    defaultPrevented: false,
+    button: 0,
+    buttons: 1,
+    preventDefault() {},
+    stopPropagation() {},
+    persist() {},
+    nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true }),
+  };
+}
+
 function getProps(fiber: Fiber): Record<string, unknown> {
   return fiber.memoizedProps ?? fiber.pendingProps ?? {};
 }
@@ -468,13 +540,14 @@ function findListboxFor(input: HTMLElement): Element | null {
     }
   }
 
-  // 4) Last resort
-  if (all.length > 0) {
-    console.log(
-      `[WorkdayAgent main-world] findListboxFor: falling back to latest-in-DOM-order listbox (no visible multi-option candidates)`,
-    );
-    return all[all.length - 1];
-  }
+  // 4) No good candidate. Don't fall back to "latest in DOM order" —
+  // that's how the source dropdown attempts ended up matching against
+  // the country phone code's chip indicator and producing junk
+  // diagnostics. Better to fail cleanly so callers know the picker
+  // didn't open.
+  console.log(
+    `[WorkdayAgent main-world] findListboxFor: no listbox associated with the input (none aria-controls'd, none visible multi-option). Total listboxes in DOM: ${all.length}`,
+  );
   return null;
 }
 
