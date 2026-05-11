@@ -83,43 +83,36 @@ A Chrome extension that fills Workday job applications. Build-in-public.
   "use my last application"). Fresh-start flows where Workday renders
   one block and the user must click "Add Another" to expand are
   explicitly out of scope for v1; deferred to v2.
-- **Combobox typeahead fill: v1 limitation + v0.0.10 v2 scaffold in
-  place, awaiting first live test.** Text inputs, button widgets
-  (Country, State, Phone Device Type), radios, checkboxes, and
-  customAnswers all fill correctly via content-script-only logic.
-  But Workday's combobox typeahead widgets (the `selectinput-*`
-  `data-uxi-element-id` pattern — e.g., "How Did You Hear About Us?",
-  "Country / Territory Phone Code", "School", "Field of Study") don't
-  respond to synthetic DOM events from the content script. We verified
-  the native value setter writes the input correctly (`el.value` reads
-  back as expected after typing), but Workday's React filter handler
-  never fires — regardless of which event types we dispatch (`keydown`,
-  `beforeinput`, `input`, `keyup`).
-  Two sub-categories observed:
-  - **Flat-but-virtualized** lists (e.g., Country Phone Code): ~200
-    countries, only ~23 rendered at a time, alphabetically.
-  - **Hierarchical** lists (e.g., "How Did You Hear About Us?"): top
-    level is categories ("Advertisement", "Partnership"); leaves like
-    "Internet Advertisement" live inside. The hierarchical fallback in
-    `fillCombobox` (v0.0.9) walks top-level options for tree pickers
-    of ≤10 categories, prioritizing categories whose name appears in
-    the target value — content-script-only, works without main-world
-    access.
-  v0.0.10 added the v2 architecture scaffold:
-  `src/injected/{protocol.ts,main.ts,bridge.ts}` plus a second
-  `content_scripts` entry with `world: 'MAIN'` `run_at: 'document_start'`
-  in `vite.config.ts`. The main-world script walks the React fiber for
-  a target combobox input, finds the first ancestor exposing a callable
-  handler matching the `CANDIDATE_HANDLER_NAMES` allowlist, uses the
-  prototype value setter, and invokes the handler with a synthetic
-  React-shaped event. Diagnostic-first: every combobox fill attempt
-  also sends a `fiber-inspect` request whose response logs every
-  on-prefixed handler prop visible on ancestor fibers — so the first
-  live test produces the data needed to refine the allowlist if
-  Workday's combobox uses a non-standard handler name. Open unknown:
-  the @crxjs/vite-plugin emits the main-world script as a loader with
-  dynamic `import()`. If Workday's page CSP blocks that, the failure
-  mode is silent (no `[WorkdayAgent main-world] injected` log + 4-second
-  bridge timeouts on each combobox); fallback would be inlining the
-  bundle as an IIFE and injecting via `<script>` tag from the content
-  script.
+- **Combobox typeahead fill: v2 architecture verified live; one
+  edge case (empty combobox open) is the remaining gap.**
+  As of v0.0.16, the v2 main-world architecture is working end-to-end:
+  - Dynamic `import()` from MAIN world works under Workday's CSP
+    (`[WorkdayAgent main-world] injected on ...` boot log appears)
+  - React fiber traversal works (`__reactFiber$<hash>` keys present,
+    walk-up succeeds to bounded depth)
+  - Handler discovery works (`onSearch` found at depth 7 on Workday's
+    typeahead component, called with `(value)` signature)
+  - Opener discovery works (`onSelectInputClick` found at depth 10,
+    called with synthetic mouse event)
+  - Listbox lookup is scoped to the source input (`findListboxFor`
+    uses aria-controls / aria-owns / visibility + multi-option +
+    DOM-distance heuristics; returns null cleanly when no listbox
+    is associated, rather than picking up unrelated chip indicators)
+  - Skip-if-already-filled detection works for combobox typeaheads
+    (chip text `"1 item selected, <label>"`) and button widgets
+    (`displayText` equals target)
+  Live results on contact-info step: 14 filled, 3 skipped, 0 errors,
+  0 false positives. All Workday button widgets and pre-filled
+  comboboxes correctly skip without reopening their listbox.
+  **Remaining limitation:** an EMPTY Workday combobox (no chip
+  selected yet) doesn't open its listbox in response to any of the
+  React handlers we currently invoke. We've verified `onSelectInputClick`
+  is the correct opener prop and we ARE calling it — but Workday's
+  open logic requires something we're not providing. Hypotheses for
+  future investigation: the handler may inspect `event.isTrusted`,
+  may need focus before invocation, may need the call via `stateNode`
+  instead of the prop, or may be gated on a `preventDefault`-able
+  arg shape. Resolving requires inspecting `onSelectInputClick.toString()`
+  in DevTools on a real Workday tenant. v2 fix planned but not
+  implemented; users currently fill empty source-dropdown-style
+  combos manually.
