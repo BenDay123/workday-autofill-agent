@@ -76,7 +76,7 @@ const SKIP_HANDLER_DEPTHS = new Set([0, 1]);
 // ---- Boot ----
 
 console.log(
-  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.13)`,
+  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.14)`,
 );
 
 window.addEventListener('message', onMessage);

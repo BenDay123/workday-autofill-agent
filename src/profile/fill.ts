@@ -245,6 +245,19 @@ async function fillByWidget(
       field.uxiElementId?.startsWith('selectinput-') ||
       el.getAttribute('role') === 'combobox'
     ) {
+      // Skip-if-already-filled. Workday combobox typeaheads don't re-open
+      // their listbox when a value is already selected — clicking the
+      // input does nothing because Workday treats the field as "done."
+      // Detect by checking the field's captured context for the chip
+      // indicator string Workday renders for selected values.
+      if (comboboxAlreadyShowsTarget(field, String(value))) {
+        console.log(
+          `[WorkdayAgent] fillCombobox: chip already shows "${value}" (context="${field.context}"); skipping`,
+        );
+        if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
+        result.filled++;
+        return;
+      }
       const ok = await fillCombobox(el as HTMLInputElement, String(value));
       if (ok) {
         if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
@@ -271,6 +284,18 @@ async function fillByWidget(
 
   if (tag === 'button') {
     // Workday's paired button-listbox custom select.
+    // Skip-if-already-shown: button widgets carry their visible label in
+    // displayText. If it already matches our target, don't reopen the
+    // listbox — wastes a few hundred ms per button and risks unwanted
+    // state changes if the click handler is finicky.
+    if (comboboxAlreadyShowsTarget(field, String(value))) {
+      console.log(
+        `[WorkdayAgent] fillButtonWidget: button already displays "${value}"; skipping`,
+      );
+      if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
+      result.filled++;
+      return;
+    }
     const ok = await fillButtonWidget(el as HTMLButtonElement, String(value));
     if (ok) {
       if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
@@ -827,6 +852,29 @@ function setInputValueViaProto(el: HTMLInputElement, value: string): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// True if the scanned field's surrounding context already shows the
+// target value as a selected chip. Workday combobox typeaheads render
+// the chip as a "1 item selected, <label>" string in the parent
+// element's textContent (we picked this up during scanning as
+// field.context). Match on the chip's label content rather than the
+// raw context string, with some forgiveness on whitespace.
+function comboboxAlreadyShowsTarget(
+  field: { context?: string | null; displayText?: string | null },
+  targetValue: string,
+): boolean {
+  const target = targetValue.trim().toLowerCase();
+  if (!target) return false;
+  const ctx = (field.context ?? '').trim().toLowerCase();
+  if (!ctx) return false;
+  const m = ctx.match(/^1 items? selected,\s*(.+)$/i);
+  if (m && m[1]?.trim() === target) return true;
+  // Also accept the case where displayText itself is the captured value
+  // (some Workday widgets don't expose the chip-style context).
+  const display = (field.displayText ?? '').trim().toLowerCase();
+  if (display && display === target) return true;
+  return false;
 }
 
 // Dispatch Escape to dismiss any currently-open listboxes. Workday
