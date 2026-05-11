@@ -424,7 +424,15 @@ async function tryMainWorldFill(
   // debugging data on every attempt — costs almost nothing.
   try {
     const inspect = await requestFiberInspect(selector);
-    console.log('[WorkdayAgent] fiber-inspect result:', inspect);
+    console.log('[WorkdayAgent] fiber-inspect (raw JSON):', JSON.stringify(inspect));
+    if (inspect.fiberFound) {
+      // One flat line per ancestor — easy to copy/paste without expanding objects.
+      for (const a of inspect.ancestors) {
+        console.log(
+          `[WorkdayAgent] fiber-inspect ancestor d=${a.depth} type=${a.typeName} handlers=${JSON.stringify(a.handlerPropNames)}`,
+        );
+      }
+    }
   } catch (err) {
     console.log(
       '[WorkdayAgent] fiber-inspect failed (main-world script may not be loaded):',
@@ -437,7 +445,7 @@ async function tryMainWorldFill(
   try {
     const variants = searchVariants(targetValue);
     const response = await requestComboboxFill(selector, targetValue, variants);
-    console.log('[WorkdayAgent] main-world combobox-fill response:', response);
+    console.log('[WorkdayAgent] main-world combobox-fill (raw JSON):', JSON.stringify(response));
     return response.status === 'filled';
   } catch (err) {
     console.log('[WorkdayAgent] main-world combobox-fill failed:', (err as Error).message);
@@ -526,9 +534,18 @@ async function tryHierarchicalSelect(targetValue: string): Promise<boolean> {
     const match = findOptionMatchInLatestListbox(targetValue);
     if (match) {
       const matchLabel = match.textContent?.trim() ?? '';
-      // Don't re-click the same category we just opened (matches by self).
-      if (matchLabel === categoryLabel) {
-        // continue to back-out below
+      // Reject matches that look like the click had a side effect on an
+      // adjacent widget rather than actually drilling in:
+      //   - matched option label equals the category we clicked
+      //     (matched self — we're looking at a stale listbox)
+      //   - matched option label was in the original top-level set
+      //     (no new sub-options appeared; this is just the same listbox
+      //     or a different field's listbox)
+      const sideEffect = matchLabel === categoryLabel || initialLabels.has(matchLabel);
+      if (sideEffect) {
+        console.log(
+          `[WorkdayAgent] tryHierarchicalSelect: rejected suspicious "match" — "${matchLabel}" was either the category itself or already in the top-level set`,
+        );
       } else {
         console.log(`[WorkdayAgent] tryHierarchicalSelect: matched "${matchLabel}" under "${categoryLabel}"`);
         dispatchClickSequence(match);
