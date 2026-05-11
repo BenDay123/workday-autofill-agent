@@ -358,6 +358,15 @@ async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string
 //     parenthetical suffix from the filter query, but keep the original
 //     captured value as a search variant for matching after filter
 async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<boolean> {
+  // Step 0: close any listboxes left open by previous fills. Workday
+  // doesn't always close the previous widget's listbox before the next
+  // one opens, which causes `findOptionMatchInLatestListbox` (DOM-order
+  // last-wins) to read the wrong listbox and confuses the hierarchical
+  // walker (e.g., reads the phone-device-type listbox while filling
+  // the country-phone-code combobox).
+  closeOpenListboxes();
+  await sleep(80);
+
   // Step 1: open the dropdown via full click sequence (synthetic .click()
   // alone may not register with Workday's pointer-event handlers).
   dispatchClickSequence(inputEl);
@@ -534,17 +543,34 @@ async function tryHierarchicalSelect(targetValue: string): Promise<boolean> {
     const match = findOptionMatchInLatestListbox(targetValue);
     if (match) {
       const matchLabel = match.textContent?.trim() ?? '';
-      // Reject matches that look like the click had a side effect on an
-      // adjacent widget rather than actually drilling in:
-      //   - matched option label equals the category we clicked
-      //     (matched self — we're looking at a stale listbox)
-      //   - matched option label was in the original top-level set
-      //     (no new sub-options appeared; this is just the same listbox
-      //     or a different field's listbox)
-      const sideEffect = matchLabel === categoryLabel || initialLabels.has(matchLabel);
-      if (sideEffect) {
+      // After clicking the category, the latest listbox in DOM order
+      // might be a single-option chip-indicator from an UNRELATED
+      // widget (e.g., country-phone-code chip showing "United States
+      // of America (+1)") rather than a real drill-in result. Require:
+      //   1) the match isn't the category itself
+      //   2) the match wasn't already in the top-level option set
+      //   3) the listbox containing the match has multiple options
+      //      (real drill-down sub-lists do, single-option indicators
+      //      don't)
+      //   4) the listbox is NOT our original top-level listbox
+      const listboxes = document.querySelectorAll('[role="listbox"]');
+      const currentListbox = listboxes[listboxes.length - 1] ?? null;
+      const optionCount = currentListbox
+        ? currentListbox.querySelectorAll('[role="option"]').length
+        : 0;
+      const isStaleSingleOption = optionCount <= 1;
+      const isSameListboxAsTopLevel = currentListbox === listbox;
+      const matchedSelf = matchLabel === categoryLabel;
+      const matchedExistingTopLevel = initialLabels.has(matchLabel);
+
+      if (
+        matchedSelf ||
+        matchedExistingTopLevel ||
+        isStaleSingleOption ||
+        isSameListboxAsTopLevel
+      ) {
         console.log(
-          `[WorkdayAgent] tryHierarchicalSelect: rejected suspicious "match" — "${matchLabel}" was either the category itself or already in the top-level set`,
+          `[WorkdayAgent] tryHierarchicalSelect: rejected suspicious "match" — label="${matchLabel}" matchedSelf=${matchedSelf} matchedExistingTopLevel=${matchedExistingTopLevel} isStaleSingleOption=${isStaleSingleOption} sameAsTopLevel=${isSameListboxAsTopLevel}`,
         );
       } else {
         console.log(`[WorkdayAgent] tryHierarchicalSelect: matched "${matchLabel}" under "${categoryLabel}"`);
@@ -733,6 +759,28 @@ function setInputValueViaProto(el: HTMLInputElement, value: string): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Dispatch Escape to dismiss any currently-open listboxes. Workday
+// occasionally leaves them in the DOM after a fill, which makes
+// "latest listbox" detection grab the wrong widget's options for the
+// next combobox attempt.
+function closeOpenListboxes(): void {
+  const escInit: KeyboardEventInit = {
+    key: 'Escape',
+    code: 'Escape',
+    keyCode: 27,
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  };
+  document.body.dispatchEvent(new KeyboardEvent('keydown', escInit));
+  document.body.dispatchEvent(new KeyboardEvent('keyup', escInit));
+  if (document.activeElement instanceof HTMLElement) {
+    document.activeElement.dispatchEvent(new KeyboardEvent('keydown', escInit));
+    document.activeElement.dispatchEvent(new KeyboardEvent('keyup', escInit));
+    document.activeElement.blur();
+  }
 }
 
 function waitForElement(selector: string, timeoutMs = 2000): Promise<Element | null> {

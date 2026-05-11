@@ -35,27 +35,48 @@ import { MESSAGE_NAMESPACE, isWAMessage } from './protocol';
  *  but be defensive). */
 const MAX_FIBER_DEPTH = 30;
 
-/** Likely React-handler prop names to look for when walking up the
- *  fiber chain for a combobox. The actual name in Workday's case is
- *  unknown until first live spike — see fiber-inspect path. Order
- *  matters: first match wins. */
+/** React-handler prop names to look for when walking up the fiber chain
+ *  for a combobox. Order is significant: first match wins. We prefer
+ *  filter-specific names (onSearch is Workday's choice — verified via
+ *  fiber-inspect on a real Workday tenant, where `onSearch` appears at
+ *  depths 7 and 10 on the typeahead components) over generic `onChange`,
+ *  which on combobox inputs is just the React form-control wiring and
+ *  doesn't trigger Workday's filter logic. */
 const CANDIDATE_HANDLER_NAMES = [
-  'onChange',
-  'onInputChange',
-  'onFilterChange',
   'onSearch',
-  'onSearchChange',
-  'onQueryChange',
   'onFilter',
+  'onFilterChange',
+  'onQueryChange',
+  'onSearchChange',
+  'onInputChange',
   'onValueChange',
   'onSelect',
   'onOptionSelect',
+  'onChange', // generic — fallback only
 ];
+
+/** Handler-prop names that expect a `(value: string)` signature rather
+ *  than the React `(event)` signature of onChange. */
+const VALUE_FIRST_HANDLERS = new Set([
+  'onSearch',
+  'onFilter',
+  'onFilterChange',
+  'onQueryChange',
+  'onSearchChange',
+  'onInputChange',
+  'onValueChange',
+]);
+
+/** Fiber depths to skip when looking for the combobox handler. Depths
+ *  0–1 are the input element itself and its `Styled(input)` wrapper —
+ *  those carry React form-control onChange, not Workday's filter
+ *  handler. The real combobox component sits a few levels higher. */
+const SKIP_HANDLER_DEPTHS = new Set([0, 1]);
 
 // ---- Boot ----
 
 console.log(
-  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.10-scaffold)`,
+  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.12)`,
 );
 
 window.addEventListener('message', onMessage);
@@ -166,7 +187,10 @@ function handleComboboxFill(req: ComboboxFillRequest): void {
   }
 
   // Walk up looking for an ancestor whose props expose a callable handler
-  // matching the allowlist.
+  // matching the allowlist. Depths in SKIP_HANDLER_DEPTHS (the input
+  // element itself and its Styled() wrapper) are walked through but
+  // their handlers are ignored — those have React form-control wiring,
+  // not the combobox filter handler.
   const fiber = (el as unknown as Record<string, unknown>)[fiberKey] as Fiber | null;
   let owner: Fiber | null = null;
   let handlerName: string | undefined;
@@ -174,17 +198,19 @@ function handleComboboxFill(req: ComboboxFillRequest): void {
   let depth = 0;
   let current: Fiber | null = fiber;
   while (current && depth < MAX_FIBER_DEPTH) {
-    const props = getProps(current);
-    for (const name of CANDIDATE_HANDLER_NAMES) {
-      const candidate = props[name];
-      if (typeof candidate === 'function') {
-        owner = current;
-        handlerName = name;
-        handler = candidate as (...args: unknown[]) => unknown;
-        break;
+    if (!SKIP_HANDLER_DEPTHS.has(depth)) {
+      const props = getProps(current);
+      for (const name of CANDIDATE_HANDLER_NAMES) {
+        const candidate = props[name];
+        if (typeof candidate === 'function') {
+          owner = current;
+          handlerName = name;
+          handler = candidate as (...args: unknown[]) => unknown;
+          break;
+        }
       }
+      if (handler) break;
     }
-    if (handler) break;
     current = current.return ?? null;
     depth++;
   }
@@ -241,8 +267,17 @@ function handleComboboxFill(req: ComboboxFillRequest): void {
     nativeEvent: new Event('change', { bubbles: true }),
   };
 
+  // Workday's onSearch et al. take `(value: string)`; React's onChange
+  // convention takes `(event)`. Match the signature to the handler so
+  // the filter actually fires.
+  const useValueSignature = VALUE_FIRST_HANDLERS.has(handlerName);
+
   try {
-    handler(syntheticEvent);
+    if (useValueSignature) {
+      handler(req.targetValue);
+    } else {
+      handler(syntheticEvent);
+    }
   } catch (err) {
     respond<ComboboxFillResponse>({
       namespace: MESSAGE_NAMESPACE,
