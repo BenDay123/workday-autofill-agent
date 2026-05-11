@@ -1,4 +1,127 @@
-## 2026-05-09 — First real scan, what Workday's DOM actually looks like
+## 2026-05-10 — Fixed the merge bug, then hit the wall I'd been warned about
+
+Two bugs going in. One fixed and verified, one diagnosed and deferred to v2.
+That second one is where the session got interesting.
+
+**Bug 1: the merge architecture was overwriting captured data.**
+
+Last session ended with `preferences.preferredSource` disappearing mid-session.
+The cause was section-level merge — when a capture touched any field inside
+a top-level section (say `preferences`), `mergeWithExisting` replaced the
+whole section. The new section came from a fresh `createEmptyProfile()` plus
+whatever the current step actually filled in. So a fresh contact-info capture
+would write `preferences = { willingToRelocate: false (default),
+hasNonCompeteRestrictions: false (default), preferredSource: "Job Alert" }`,
+and an Application Questions capture immediately after would overwrite that
+with `preferences = { willingToRelocate: true, hasNonCompeteRestrictions:
+false, /* no preferredSource */ }` — nuking the source value.
+
+Fix: granular path tracking. Capture now records every dotted path it
+actually wrote (`preferences.preferredSource`, `contact.address.line1`, etc.)
+plus markers for array sections (`workExperience[]`) and keyed entries
+(`websites[label=LinkedIn]`, `customAnswers[pattern=...]`). `mergeWithExisting`
+deep-clones the existing profile and applies each touched path individually
+— object leaves get deep-set, arrays get replaced wholesale, keyed entries
+match-replace-or-append. Bonus: `customAnswers` now merges by pattern key, so
+re-capturing a step no longer duplicates Q&A.
+
+Verified live: captured contact-info step (preferredSource = "Internet
+Advertisement" landed), navigated to Application Questions, captured again,
+preferredSource survived. Shipped as v0.0.6.
+
+**Bug 2: the combobox typeahead bug, where I hit the architectural wall.**
+
+The captured chip text for Country Phone Code is "United States of America
+(+1)" but the listbox option is presumably "United States (+1)". So I built
+a diagnostic that, on match failure, dumps the actual option labels Workday
+is showing. That was v0.0.7.
+
+The diagnostic immediately surfaced two distinct combobox failures:
+
+1. **Source dropdown ("How Did You Hear About Us?") is hierarchical.** The
+   five top-level options are categories: Advertisement, Partnership,
+   Socially, Website, Workday. "Internet Advertisement" lives inside the
+   Advertisement category. Our flat-list search can never reach it.
+
+2. **Phone Code combobox is alphabetical and lazy-loaded.** Even AFTER
+   typing the target value, the listbox showed the alphabetical first
+   page (Afghanistan through Benin — 23 options). My filter wasn't firing.
+
+So I iterated on the typing. Added `keydown`/`keyup` events on the theory
+that Workday's filter listens for keystrokes, not just `input` events. No
+change. Added `beforeinput`. Trimmed the filter query to first 2 words after
+stripping the parenthetical ("United States of America" instead of "United
+States of America (+1)"). No change. Added a mid-typing diagnostic that logs
+`el.value` after the typing loop finishes.
+
+That last diagnostic was the key. The log read:
+
+> typeIntoCombobox: input value after typing is "United States"
+
+The input's value is correct. The native setter trick works. The events
+fire. The listbox still shows A–B alphabetical.
+
+**The wall:** Workday's React combobox filter handler is not responding to
+any synthetic DOM event I can dispatch from a content script. Either it's
+wired to React-internal mechanisms I can't reach, or it checks `isTrusted`
+and rejects synthetic events outright. This is exactly the widget class
+CLAUDE.md predicted I'd hit — the one that motivates the two-script (content
++ injected) architecture. The fix isn't "one more event type." The fix is
+running code in the page's main JS world, traversing React fibers to find
+the combobox component, and calling its onChange handler directly. That's
+v2 work.
+
+Practically: v1 fills 13/15 fields on this contact-info step (87%) — text
+inputs, button widgets, radios, checkboxes, customAnswers all work. The two
+that fail are both Workday combobox typeahead widgets. Same widget class on
+later steps (School, Field of Study, Skills typeahead) will also fail until
+v2.
+
+**Why this is actually good for the build narrative.**
+
+The LinkedIn post needs a "what I learned about agent architecture" beat,
+and this is it. Chrome extensions have two JS worlds: the isolated content
+script world (sees the DOM, doesn't see the page's JS variables) and the
+page's main world (sees React, but can't talk to the extension directly).
+For most of v1, I got away with content-script-only because the native value
+setter trick is just JavaScript. But the moment I hit a widget that's
+controlled by React internals (not just DOM state), the worlds matter. The
+fix is to inject a script tag into the page that runs in the main world,
+and pipe messages between it and the content script via `window.postMessage`
+or DOM events. That's an architectural step, not a bug fix.
+
+Shipped v0.0.8 with the iteration (it doesn't fix the bug but ratchets out
+the easy hypotheses), and documented the combobox-typing limitation in
+CLAUDE.md as the explicit v1/v2 boundary.
+
+**What I learned the hard way today.**
+
+- "Add more event types" only works if the issue is event types. When the
+  underlying app is controlled by React internals, no DOM event dance gets
+  you there.
+- Diagnostics that print what the system is actually doing (not what you
+  hope it's doing) are the single best debugging investment. The
+  `el.value after typing` log took 30 seconds to write and saved me from
+  burning the rest of the session adding more event types.
+- The decision to ship v1 with a known limitation is often the right one,
+  especially when the limitation has a clear v2 path AND is itself a
+  story worth telling.
+
+**What's next:**
+
+- Decide whether v1 is "done enough" for the LinkedIn post. With 13/15 fill
+  on contact-info, all of identity / contact / work experience / education
+  / radio Q&A working, this is already a real demo. The combobox gap is a
+  narrated limitation.
+- If continuing: v2 injected-script architecture for combobox + skills
+  typeahead. Hierarchical click-walking for the source dropdown. Optional:
+  LLM-based field matching for tenants whose label phrasing breaks our
+  regex map.
+- Either way, an end-to-end screen recording on a real Workday application
+  is the next concrete step — captures the v1 win and the v2 backlog
+  honestly.
+
+
 
 Got Path A live in the morning — tightened detection so the scanner stops
 grabbing top-nav buttons and the paired hidden inputs Workday uses behind
@@ -319,7 +442,7 @@ Slow down and read the output.
 
 **Working name:** `workday-autofill-agent` (GitHub repo) / "WorkdayAgent" (referential)
 **Started:** May 2026
-**Status:** v0.0.5 partially verified — fill logic confirmed working for text inputs / button widgets (Country, State, Phone Type) / radios / checkboxes / customAnswers (Workday-employee Yes/No). Two combobox bugs surfaced and need fixes next session: (1) merge architecture too aggressive — section-replace overrides existing field values with createEmptyProfile defaults when the current step doesn't have those fields, causing `preferences.preferredSource` to silently get dropped; (2) Country / Territory Phone Code combobox can't match Workday's option text ("United States of America (+1)" doesn't appear in the option list — Workday probably renders it differently).
+**Status:** v0.0.8 — verified end-to-end on contact-info step at 13/15 fields filled (87%). Text inputs, button widgets (Country / State / Phone Device Type), radios, checkboxes, and customAnswers all work. Bug 1 (merge architecture) fixed in v0.0.6: capture now records granular touched paths and `mergeWithExisting` applies only those, so a single-field capture no longer wipes sibling fields in the same section. Bug 2 (combobox typeahead) explicitly deferred to v2: diagnostic in v0.0.7 surfaced two distinct failures (hierarchical source dropdown and alphabetical-paginated phone code), and the typing iteration in v0.0.8 proved the gap isn't in our value-setting (verified `el.value` reads back correctly after typing) but in Workday's React filter handler not responding to synthetic DOM events. Real fix needs the two-script (content + injected) architecture documented in CLAUDE.md.
 
 ## What this is
 
@@ -718,14 +841,15 @@ the manifest paths have changed.
 - Locked profile data model decisions (see "Architectural decisions made so far" in CLAUDE.md and the data-model section in this entry).
 - Wrapped session here with architecture in hand, ready for implementation work next time.
 
+### Session 7.7 — Path-level merge, combobox diagnostic, hit the v1/v2 wall
+- Bug 1 (merge architecture): replaced section-level `mergeWithExisting` with granular path-level merge. CaptureResult now records every touched dotted path; object leaves get deep-set, array sections get replaced wholesale, keyed entries (websites, customAnswers) match-replace-or-append. Verified end-to-end: captured `preferences.preferredSource = "Internet Advertisement"` from contact-info, then captured Application Questions (touches `preferences.willingToRelocate`), preferredSource survived. Shipped as v0.0.6.
+- Bug 2 (combobox typing): built a listbox-mismatch diagnostic that dumps actual option labels on match failure. Immediately surfaced two distinct combobox failures — Source dropdown is hierarchical (5 categories at top level, "Internet Advertisement" lives inside "Advertisement"), Phone Code is alphabetical and lazy-loaded (~200 countries, only 23 rendered). Shipped diagnostic as v0.0.7.
+- Iterated on combobox typing (v0.0.8): added `keydown` / `beforeinput` / `keyup` events, trimmed filter query to first 2 words after stripping parentheticals, added mid-typing diagnostic logging `el.value` after the typing loop. The diagnostic was the breakthrough — it confirmed our value writes are landing (`el.value` correctly reads back as "United States" after typing) but the listbox still shows A–B unfiltered. Conclusion: Workday's React combobox filter doesn't respond to any synthetic DOM event from the content-script world.
+- Hit the exact widget class CLAUDE.md predicted would force the two-script (content + injected) architecture. Documented in CLAUDE.md as the explicit v1/v2 boundary. Real fix is page-main-world injected script + React fiber traversal — deferred to v2.
+- End-state on contact-info step: 13/15 fields filled (87%). All fail-cases are Workday combobox typeaheads.
+
 ### Tomorrow / next session
-- Finish capture verification on a `useMyLastApplication` URL — confirm work experience, education, and voluntary disclosures populate correctly. Find any further mapping bugs and patch.
-- Then start **fill logic** — the actual demo. Per-widget-type dispatch:
-  - Plain text inputs / textareas: dispatch React's `input` / `change` / `blur` events
-  - Button widgets (Country / State / Phone Type): click button → wait for listbox → click matching option
-  - Comboboxes (How Did You Hear, Country Phone Code, School / Field of Study): click → type to filter → click first matching result
-  - DateSection inputs: dispatch React events on month and year inputs
-  - Checkboxes / radios: dispatch click only if state needs to change
-  - File upload: explicit limitation; can't programmatically set file inputs in browsers — needs a separate "stage your resume" UI
-- Architecture for fill: needs the injected-script half of the two-script architecture (per CLAUDE.md) so React events dispatch in the page's main world, not the content script's isolated world.
-- Voluntary-disclosure fill-time visual cue (the v1 nice-to-have we agreed on).
+- Decide whether v1 is "done enough" for the LinkedIn post. With 13/15 fill on contact-info (and identity / contact / work experience / education / radio Q&A all working), this is already a demo-able result. The combobox gap is itself a narrated lesson worth telling.
+- Record an end-to-end screen capture on a real Workday application: capture from multiple steps, then fill on a fresh `useMyLastApplication` URL. Document what fills and what doesn't.
+- If continuing into v2 architecture: build the injected-script half (page-main-world execution + content↔injected message passing) and traverse React fibers to invoke combobox handlers directly. Hierarchical click-walking for the source dropdown is also a content-script-only fix worth doing alongside.
+- Defer further: LLM-based semantic mapping for tenants whose label phrasing breaks the regex map. Fresh-start (one-block, click-Add-Another) Workday flows for work experience / education.

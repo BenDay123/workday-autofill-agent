@@ -83,3 +83,24 @@ A Chrome extension that fills Workday job applications. Build-in-public.
   "use my last application"). Fresh-start flows where Workday renders
   one block and the user must click "Add Another" to expand are
   explicitly out of scope for v1; deferred to v2.
+- **Combobox typeahead fill is broken in v1 and deferred to v2.** Text
+  inputs, button widgets (Country, State, Phone Device Type), radios,
+  checkboxes, and customAnswers all fill correctly. But Workday's
+  combobox typeahead widgets (the `selectinput-*` `data-uxi-element-id`
+  pattern — e.g., "How Did You Hear About Us?", "Country / Territory
+  Phone Code", "School", "Field of Study") don't respond to synthetic
+  DOM events from the content script. We verified the native value
+  setter writes the input correctly (`el.value` reads back as expected
+  after typing), but Workday's React filter handler never fires —
+  regardless of which event types we dispatch (`keydown`, `beforeinput`,
+  `input`, `keyup`). This is the widget class that motivates the
+  two-script (content + injected) architecture: v2 will add a
+  page-main-world injected script and invoke the React handler via
+  fiber traversal. Two sub-categories observed:
+  - **Flat-but-virtualized** lists (e.g., Country Phone Code): ~200
+    countries, only ~23 rendered at a time, alphabetically. Without
+    filter, scrolling is the only path.
+  - **Hierarchical** lists (e.g., "How Did You Hear About Us?"): top
+    level is categories ("Advertisement", "Partnership"); leaves like
+    "Internet Advertisement" live inside. Even with filter working,
+    these need click-to-expand walking.
