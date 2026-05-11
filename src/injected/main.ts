@@ -86,7 +86,7 @@ const SKIP_HANDLER_DEPTHS = new Set([0, 1]);
 // ---- Boot ----
 
 console.log(
-  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.15)`,
+  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.16)`,
 );
 
 window.addEventListener('message', onMessage);
@@ -391,12 +391,18 @@ function findFiberKey(el: Element): string | undefined {
 function findOpenerInFiberTree(
   fiber: Fiber | null,
 ): { handler: (...args: unknown[]) => unknown; name: string; depth: number } | null {
-  let current: Fiber | null = fiber;
-  let depth = 0;
-  while (current && depth < MAX_FIBER_DEPTH) {
-    if (!SKIP_HANDLER_DEPTHS.has(depth)) {
-      const props = getProps(current);
-      for (const name of OPENER_HANDLER_NAMES) {
+  // Outer loop on NAME (priority), inner on depth. We want
+  // onSelectInputClick anywhere in the tree to beat onClick at a
+  // shallower depth — name priority matters more than "first ancestor
+  // we hit." Previous version (depth-outer) accidentally picked
+  // onClick at d=5 because it stopped at the first depth with ANY
+  // matching name, never reaching d=10's onSelectInputClick.
+  for (const name of OPENER_HANDLER_NAMES) {
+    let current: Fiber | null = fiber;
+    let depth = 0;
+    while (current && depth < MAX_FIBER_DEPTH) {
+      if (!SKIP_HANDLER_DEPTHS.has(depth)) {
+        const props = getProps(current);
         const candidate = props[name];
         if (typeof candidate === 'function') {
           return {
@@ -406,9 +412,9 @@ function findOpenerInFiberTree(
           };
         }
       }
+      current = current.return ?? null;
+      depth++;
     }
-    current = current.return ?? null;
-    depth++;
   }
   return null;
 }
