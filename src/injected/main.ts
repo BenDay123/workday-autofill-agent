@@ -86,7 +86,7 @@ const SKIP_HANDLER_DEPTHS = new Set([0, 1]);
 // ---- Boot ----
 
 console.log(
-  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.17)`,
+  `[WorkdayAgent main-world] injected on ${location.href} (build: v0.0.18)`,
 );
 
 window.addEventListener('message', onMessage);
@@ -241,6 +241,48 @@ async function handleComboboxFill(req: ComboboxFillRequest): Promise<void> {
     handlerPropName: filterInfo.name,
     handlerOwnerDepth: filterInfo.depth,
   };
+
+  // Pre-flight chip check. If the input already shows a chip, ground-truth
+  // it against the target BEFORE we touch any handler. Two outcomes:
+  //   - Chip matches the target → nothing to do, treat as filled.
+  //   - Chip differs from target → respect the user's existing selection
+  //     and skip. This is the "manual choice wins" policy. Without this
+  //     pre-flight, the opener+filter sequence would attempt to overwrite,
+  //     and on catalog-mismatch cases (target value absent from this
+  //     tenant's option list) the overwrite would fail and the page would
+  //     be left in a transient half-open popup state.
+  // Uses fresh DOM (readChipCandidates), not the stale scan-time
+  // field.context that fill.ts uses — the content-script's
+  // comboboxAlreadyShowsTarget can miss chips selected between scan and
+  // fill, this can't.
+  const preflightChips = readChipCandidates(el);
+  if (preflightChips.length > 0) {
+    const matching = chipMatchesAnyVariant(el, req.searchVariants);
+    if (matching) {
+      console.log(
+        `[WorkdayAgent main-world] pre-flight chip-check: chip already matches "${matching}" — no fill needed`,
+      );
+      respond<ComboboxFillResponse>({
+        namespace: MESSAGE_NAMESPACE,
+        kind: 'combobox-fill-response',
+        id: req.id,
+        status: 'filled',
+        diagnostics: { ...baseDiag, optionsSeen: preflightChips, chosenOption: matching },
+      });
+      return;
+    }
+    console.log(
+      `[WorkdayAgent main-world] pre-flight chip-check: existing chip(s) ${JSON.stringify(preflightChips)} differ from target "${req.targetValue}" — respecting user's manual selection`,
+    );
+    respond<ComboboxFillResponse>({
+      namespace: MESSAGE_NAMESPACE,
+      kind: 'combobox-fill-response',
+      id: req.id,
+      status: 'skip-preselected',
+      diagnostics: { ...baseDiag, optionsSeen: preflightChips, chosenOption: preflightChips[0] },
+    });
+    return;
+  }
 
   // Phase A: open the listbox via React opener. Clear the input first —
   // if any prior content-script step left text in there, Workday's

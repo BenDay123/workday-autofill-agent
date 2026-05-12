@@ -220,6 +220,24 @@ async function fillByWidget(
   // Track voluntary-disclosure fields for the visual cue.
   const isVoluntaryDisclosure = path.startsWith('voluntaryDisclosures.');
 
+  // Respect-existing-value policy: if the widget already shows a
+  // non-default value that doesn't match the profile target, don't
+  // overwrite — preserve whatever's there (manual entry, Workday
+  // auto-prefill, or a prior fill the user kept). Counts as skipped
+  // with a distinct log so the user can audit which fields were
+  // respected vs which weren't fillable for other reasons.
+  // Combobox typeaheads are gated by the main-world pre-flight instead;
+  // hasUnmatchedExistingValue returns null for them so we still bridge
+  // out and let main-world ground-truth the chip.
+  const existing = hasUnmatchedExistingValue(field, String(value));
+  if (existing) {
+    console.log(
+      `[WorkdayAgent] respecting existing value at ${path}: ${existing.reason}, current="${existing.current}"; skipping fill of "${String(value).slice(0, 60)}"`,
+    );
+    result.skipped++;
+    return;
+  }
+
   if (tag === 'input') {
     if (type === 'checkbox') {
       fillCheckable(el as HTMLInputElement, !!value);
@@ -253,11 +271,11 @@ async function fillByWidget(
       field.uxiElementId?.startsWith('selectinput-') ||
       el.getAttribute('role') === 'combobox'
     ) {
-      // Skip-if-already-filled. Workday combobox typeaheads don't re-open
-      // their listbox when a value is already selected — clicking the
-      // input does nothing because Workday treats the field as "done."
-      // Detect by checking the field's captured context for the chip
-      // indicator string Workday renders for selected values.
+      // Skip-if-already-filled (scan-time). Catches the common case
+      // where scanning captured the chip text in field.context — saves
+      // a round-trip to the main world. The main-world pre-flight
+      // chip-check handles the harder case where the chip appeared
+      // between scan and fill.
       if (comboboxAlreadyShowsTarget(field, String(value))) {
         console.log(
           `[WorkdayAgent] fillCombobox: chip already shows "${value}" (context="${field.context}"); skipping`,
@@ -266,11 +284,16 @@ async function fillByWidget(
         result.filled++;
         return;
       }
-      const ok = await fillCombobox(el as HTMLInputElement, String(value));
-      if (ok) {
+      const outcome = await fillCombobox(el as HTMLInputElement, String(value));
+      if (outcome === 'filled') {
         if (isVoluntaryDisclosure) result.voluntaryDisclosureFieldsFilled.push(el);
         result.filled++;
       } else {
+        // 'skip-preselected' (main-world ground-truth: chip differs from
+        // target → respect manual choice) and 'failed' both count as
+        // skipped. The distinct log already fired in main.ts; suppress
+        // a redundant content-script log here for the skip-preselected
+        // case.
         result.skipped++;
       }
       return;
@@ -390,7 +413,9 @@ async function fillButtonWidget(buttonEl: HTMLButtonElement, targetValue: string
 //     of America (+1)" → option "United States (+1)"); strip
 //     parenthetical suffix from the filter query, but keep the original
 //     captured value as a search variant for matching after filter
-async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<boolean> {
+type FillOutcome = 'filled' | 'skip-preselected' | 'failed';
+
+async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Promise<FillOutcome> {
   // Step 0: close any listboxes left open by previous fills. Workday
   // doesn't always close the previous widget's listbox before the next
   // one opens, which causes `findOptionMatchInLatestListbox` (DOM-order
@@ -410,7 +435,7 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   if (match) {
     console.log(`[WorkdayAgent] fillCombobox: clicking unfiltered match for "${targetValue}":`, match.textContent?.trim());
     dispatchClickSequence(match);
-    return true;
+    return 'filled';
   }
 
   // Step 2b removed in v0.0.17: hierarchical drill-in moved to the
@@ -431,21 +456,21 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   // Step 3 (v2 path): delegate to the main-world injected script. It can
   // see React fibers and invoke the combobox's React handler directly,
   // which the content-script's synthetic DOM events can't reach.
-  const mainWorldOk = await tryMainWorldFill(inputEl, targetValue);
-  if (mainWorldOk) return true;
+  const outcome = await tryMainWorldFill(inputEl, targetValue);
+  if (outcome !== 'failed') return outcome;
 
   logListboxMismatch('fillCombobox', targetValue);
-  return false;
+  return 'failed';
 }
 
 async function tryMainWorldFill(
   inputEl: HTMLInputElement,
   targetValue: string,
-): Promise<boolean> {
+): Promise<FillOutcome> {
   const selector = buildSelectorForElement(inputEl);
   if (!selector) {
     console.log('[WorkdayAgent] tryMainWorldFill: could not build a stable selector for element');
-    return false;
+    return 'failed';
   }
 
   // First-run mode: also send a fiber-inspect so the page console shows
@@ -478,10 +503,12 @@ async function tryMainWorldFill(
     // bridge timeout is too tight.
     const response = await requestComboboxFill(selector, targetValue, variants, 8000);
     console.log('[WorkdayAgent] main-world combobox-fill (raw JSON):', JSON.stringify(response));
-    return response.status === 'filled';
+    if (response.status === 'filled') return 'filled';
+    if (response.status === 'skip-preselected') return 'skip-preselected';
+    return 'failed';
   } catch (err) {
     console.log('[WorkdayAgent] main-world combobox-fill failed:', (err as Error).message);
-    return false;
+    return 'failed';
   }
 }
 
@@ -685,6 +712,114 @@ function comboboxAlreadyShowsTarget(
   if (display && display === target) return true;
   return false;
 }
+
+// True when the widget's current visible value is non-empty, isn't a
+// placeholder, and doesn't match the target. "Respect the user's manual
+// choice" policy: when a value is already there, don't overwrite — even
+// if the user picked it manually OR Workday auto-pre-filled it from a
+// prior application / candidate account. Caller skips the fill and
+// logs a clear distinct line.
+//
+// Combobox typeaheads are NOT handled here — their fresh chip-readback
+// lives in the main-world script and is reported via the
+// 'skip-preselected' response status.
+function hasUnmatchedExistingValue(
+  field: FillField,
+  targetValue: string,
+): { reason: string; current: string } | null {
+  const el = field.el;
+  const tag = field.tagName;
+  const type = field.type;
+  const target = targetValue.trim().toLowerCase();
+
+  if (tag === 'input') {
+    if (type === 'checkbox') {
+      // Only block "uncheck what's currently checked". Checking an
+      // unchecked box is still allowed — the box has no "manual choice"
+      // indication when its state matches the form default (unchecked).
+      const input = el as HTMLInputElement;
+      const targetBool = !!(targetValue === 'true' || targetValue === '1' || (targetValue as unknown) === true);
+      if (input.checked && !targetBool) {
+        return { reason: 'checkbox already checked', current: 'checked' };
+      }
+      return null;
+    }
+    if (type === 'radio') {
+      // Look for ANY checked radio in this group whose value/label
+      // doesn't match the target. The fillByWidget loop processes each
+      // radio individually, so we need to peek at the group state.
+      const input = el as HTMLInputElement;
+      const name = input.name;
+      if (!name) return null;
+      const root = input.form ?? document;
+      const group = Array.from(
+        root.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${cssEscape(name)}"]`),
+      );
+      const checked = group.find((r) => r.checked);
+      if (!checked) return null;
+      const checkedVal = (checked.value ?? '').toLowerCase();
+      // The target radio is `el` itself; we want to allow filling it iff
+      // no other radio in the group is checked. If a different radio is
+      // already on, block.
+      if (checked !== input) {
+        return { reason: 'a different radio is already selected', current: checkedVal || 'unknown' };
+      }
+      return null;
+    }
+    // Combobox typeahead — handled by the main-world pre-flight, not
+    // here. Skip the input-level check for these so we still reach the
+    // main-world bridge.
+    if (
+      field.uxiElementId?.startsWith('selectinput-') ||
+      el.getAttribute('role') === 'combobox'
+    ) {
+      return null;
+    }
+    // Plain text input (and date inputs which behave like text). Read
+    // the live DOM value rather than the scan-time field.value — between
+    // scan and fill the page can mutate.
+    const live = ((el as HTMLInputElement).value ?? '').trim();
+    if (!live) return null;
+    if (live.toLowerCase() === target) return null;
+    return { reason: 'text input already has a value', current: live };
+  }
+
+  if (tag === 'textarea') {
+    const live = ((el as HTMLTextAreaElement).value ?? '').trim();
+    if (!live) return null;
+    if (live.toLowerCase() === target) return null;
+    return { reason: 'textarea already has a value', current: live };
+  }
+
+  if (tag === 'button') {
+    // Workday button-listbox custom select. displayText carries the
+    // visible label. Treat the common placeholder phrases as "empty"
+    // (Select / Choose / leading dash) so first-time fills aren't
+    // blocked. Anything else is treated as a real selection.
+    const display = (field.displayText ?? '').trim();
+    if (!display) return null;
+    if (PLACEHOLDER_LABEL.test(display)) return null;
+    if (display.toLowerCase() === target) return null;
+    return { reason: 'button select already shows a value', current: display };
+  }
+
+  if (tag === 'select') {
+    const sel = el as HTMLSelectElement;
+    const v = (sel.value ?? '').trim();
+    if (!v) return null;
+    const optText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
+    if (PLACEHOLDER_LABEL.test(optText)) return null;
+    if (v.toLowerCase() === target || optText.toLowerCase() === target) return null;
+    return { reason: 'select already has a non-default value', current: optText || v };
+  }
+
+  return null;
+}
+
+// Phrases Workday uses for the "no choice yet" sentinel in button-style
+// selects and native <select>s. Order doesn't matter; the regex covers
+// the common patterns observed across Nvidia/Workday-corp tenants.
+const PLACEHOLDER_LABEL = /^(select(\s|$)|choose(\s|$)|please\s|--|-\s)/i;
 
 // Dispatch Escape to dismiss any currently-open listboxes. Workday
 // occasionally leaves them in the DOM after a fill, which makes

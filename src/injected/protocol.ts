@@ -45,12 +45,13 @@ export type WARequest = ComboboxFillRequest | FiberInspectRequest;
 // ---- Responses: main → content ----
 
 export type ComboboxFillStatus =
-  | 'filled'        // matched and clicked an option
-  | 'no-match'      // filter fired but no option matched
-  | 'no-fiber'      // couldn't find a React fiber on the element
-  | 'no-handler'    // fiber found but no known handler prop on any ancestor
-  | 'no-element'    // selector didn't resolve in the main world
-  | 'error';        // unexpected exception (see diagnostics.errorMessage)
+  | 'filled'           // matched and clicked an option
+  | 'skip-preselected' // chip was already showing a non-target value at fill time — respect the user's manual selection
+  | 'no-match'         // filter fired but no option matched
+  | 'no-fiber'         // couldn't find a React fiber on the element
+  | 'no-handler'       // fiber found but no known handler prop on any ancestor
+  | 'no-element'       // selector didn't resolve in the main world
+  | 'error';           // unexpected exception (see diagnostics.errorMessage)
 
 export interface ComboboxFillResponse {
   namespace: typeof MESSAGE_NAMESPACE;
