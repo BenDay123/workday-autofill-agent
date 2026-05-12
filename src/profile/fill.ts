@@ -590,6 +590,13 @@ function searchVariants(targetValue: string): string[] {
   if (stripped) variants.add(stripped);
   const firstChunk = targetValue.split(/[(,]/)[0].trim();
   if (firstChunk) variants.add(firstChunk);
+  // Profile booleans get stringified to "true"/"false" by the caller.
+  // Workday button-selects and comboboxes commonly render Yes/No labels
+  // instead — match through both. Verified live on Nvidia's
+  // workAuthorization.authorizedToWorkInUS button-select where the
+  // listbox options were ['Select One', 'Yes', 'No'].
+  if (targetValue === 'true') variants.add('Yes');
+  if (targetValue === 'false') variants.add('No');
   return Array.from(variants);
 }
 
