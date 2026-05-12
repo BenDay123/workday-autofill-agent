@@ -77,10 +77,15 @@ export function createEmptyProfile(): UserProfile {
     skills: [],
     websites: [],
     workAuthorization: {
-      authorizedToWorkInUS: false,
-      requiresUSSponsorship: false,
-      sanctionedCountryCitizenOrResident: false,
-      currentOrFormerUSGovEmployee: false,
+      // null = "not captured yet" so the fill path's `value == null` guard
+      // skips these legal questions until a capture writes a real answer.
+      // Defaulting to `false` silently mis-filled "Are you authorized to
+      // work in the US?" with No for every uncaptured user — verified
+      // 2026-05-12 on Nvidia's application.
+      authorizedToWorkInUS: null,
+      requiresUSSponsorship: null,
+      sanctionedCountryCitizenOrResident: null,
+      currentOrFormerUSGovEmployee: null,
     },
     voluntaryDisclosures: {},
     preferences: {

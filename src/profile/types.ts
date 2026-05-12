@@ -113,14 +113,17 @@ export interface ResumeData {
 }
 
 // Factual / legal disclosures, US-centric for v1. Non-US work auth is v2.
+// Nullable booleans so "uncaptured" is distinguishable from "user answered
+// No" — defaulting to `false` would silently mis-fill legal questions for
+// any user whose capture flow never visited the work-auth page.
 export interface WorkAuthorization {
-  authorizedToWorkInUS: boolean;
-  requiresUSSponsorship: boolean;
+  authorizedToWorkInUS: boolean | null;
+  requiresUSSponsorship: boolean | null;
   // US export-control disclosure: citizen/national/resident of any
   // sanctioned region (Iran, Cuba, North Korea, Syria, Crimea, DNR, LNR).
-  sanctionedCountryCitizenOrResident: boolean;
+  sanctionedCountryCitizenOrResident: boolean | null;
   // Anti-corruption disclosure.
-  currentOrFormerUSGovEmployee: boolean;
+  currentOrFormerUSGovEmployee: boolean | null;
 }
 
 // EEO self-identification. Tenant labels vary; values store as whatever
