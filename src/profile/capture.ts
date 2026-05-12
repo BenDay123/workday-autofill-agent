@@ -221,6 +221,16 @@ export function captureFromScan(
       }
 
       if (pattern) {
+        // Skip patterns that look like date values rather than question
+        // text. Workday date-picker inputs sometimes carry the rendered
+        // date as aria-label, producing junk customAnswers keyed by date
+        // (e.g., pattern "05/12/2026", answer "12"). Future applications
+        // would never re-match these. Verified live 2026-05-12 on
+        // Nvidia's Self-Identify of Disability step.
+        if (/^\s*\d{1,4}[\/\-.]\d{1,4}([\/\-.]\d{1,4})?\s*$/.test(pattern)) {
+          unmatched++;
+          continue;
+        }
         const trimmedPattern = pattern.slice(0, 200);
         profile.customAnswers.push({
           pattern: trimmedPattern,
@@ -236,6 +246,29 @@ export function captureFromScan(
     matched++;
     const path = mapping.path;
     touch(path);
+
+    // Voluntary-disclosures radios: prefer the option text from
+    // "Question → Option" labels over the raw `checked` boolean readValue
+    // returns. The disabilityStatus / raceEthnicity / veteranStatus
+    // schema slots are typed as string — without this special-case,
+    // capture wrote `false`/`true` into string fields. Verified live
+    // 2026-05-12 on Nvidia's Self-Identify of Disability step.
+    if (
+      path.startsWith('voluntaryDisclosures.') &&
+      field.tagName === 'input' &&
+      field.type === 'radio' &&
+      field.label &&
+      field.label.includes(' → ')
+    ) {
+      if (field.checked === true) {
+        const idx = field.label.lastIndexOf(' → ');
+        const optionLabel = field.label.slice(idx + 3).trim();
+        setByPath(profile as unknown as Record<string, unknown>, path, optionLabel);
+      }
+      // Unchecked radios in the group don't contribute — the matched
+      // one above carries the answer for the whole question.
+      continue;
+    }
 
     // Date sentinels: collected per block, flushed at block boundaries.
     // The block's section (workExperience or education) is touched when
