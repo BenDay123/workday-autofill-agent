@@ -143,3 +143,65 @@ A Chrome extension that fills Workday job applications. Build-in-public.
   Live results (workday.wd5 contact-info step): 15 filled, 2 skipped,
   0 errors — up from 14/3 in v0.0.16. The 2 skipped are correctly
   pre-filled (Country button and Country Phone Code combobox).
+- **Respect-existing-value policy (v0.0.18+).** When a widget already
+  shows a non-default value that doesn't match the profile target,
+  skip the fill rather than overwrite. Applies across all widget types:
+  - Combobox typeaheads: main-world pre-flight chip-readback (fresh
+    DOM, not stale scan-time `field.context`). Returns new
+    `'skip-preselected'` status if chip ≠ target. Treats chip = target
+    as already-filled.
+  - Text inputs / textareas: skip if `el.value` non-empty and differs.
+  - Button-style selects: skip if displayText non-empty, not a
+    placeholder ("Select One"/"Choose..."), and differs from target.
+  - Checkboxes: only block "uncheck what's already checked" — still
+    allows checking unchecked boxes. Asymmetric on purpose because
+    checkbox default state has no manual-vs-Workday distinction.
+  - Radios: skip if any radio in the group is checked but isn't the
+    one being processed.
+  - Native `<select>`: skip if selected value/text non-empty, not a
+    placeholder, and differs.
+  Counts as `result.skipped++` with distinct `respecting existing
+  value at <path>` log. This policy is load-bearing for graceful
+  recovery from other bugs: when the v0.0.20 nullable-WorkAuth fix
+  needed the user to manually re-click Yes, respect-existing-value
+  prevented the still-stale profile from overwriting the correction.
+- **Boolean → Yes/No translation (v0.0.19).** `searchVariants` adds
+  "Yes"/"No" as alternates when the input is the literal string
+  "true"/"false". Profile booleans get stringified by the caller; this
+  closes the gap for button-selects and comboboxes whose listbox
+  options use Yes/No labels. Radio fill already handles booleans
+  natively (Workday radios have HTML `value="true"`/`"false"`).
+- **Nullable WorkAuthorization (v0.0.20).** Schema fields
+  (`authorizedToWorkInUS`, `requiresUSSponsorship`,
+  `sanctionedCountryCitizenOrResident`, `currentOrFormerUSGovEmployee`)
+  are typed `boolean | null`, default `null` in `createEmptyProfile()`.
+  The fill path's existing `value == null` guard skips uncaptured
+  legal questions. **Never default these to `false` again** — that
+  silently mis-filled "Are you legally authorized to work in the US?"
+  with No for every uncaptured user. Same risk profile likely applies
+  to any future legal-disclosure boolean.
+- **Mapping patterns must be anchored, not raw-substring (v0.0.21).**
+  `matchString` uses `.includes()` for plain-string label signals.
+  Raw substrings can match unintended fields: the canonical example
+  is `{ label: 'City' }` matching "Ethnicity" because "ethni-CITY"
+  contains "city". Use word-boundary regex (`/\bCity\b/i`) or anchored
+  regex (`/^City\b/i`) instead. Latent variants likely exist in other
+  plain-string mappings (e.g., `'First Name'` would substring-match
+  "Preferred First Name" but mapping-order currently masks it). Audit
+  when touching the mapping table.
+- **Voluntary-disclosures radio capture (v0.0.22).** When a radio's
+  mapping path starts with `voluntaryDisclosures.` AND its label has
+  `"Question → Option"` format, capture writes the Option text
+  (string) rather than the `checked` boolean. The schema slots are
+  string-typed; without this, capture wrote `false`/`true` into a
+  string field. Unchecked radios in the same group are skipped — the
+  matched (checked) one carries the answer. WorkAuthorization radio
+  capture stays boolean because those schema slots are explicitly
+  typed `boolean | null`.
+- **Date-shaped customAnswer patterns are rejected (v0.0.22).**
+  Workday date-picker inputs sometimes carry the rendered date as
+  aria-label, producing junk customAnswers like
+  `{ pattern: "05/12/2026", answer: "12" }`. Regex check in the
+  unmapped-field fallback skips patterns matching MM/DD/YYYY shapes.
+  Explicit date-field handling (sentinels for "Today's Date" /
+  signature dates) is a v2 nice-to-have, not in v1.

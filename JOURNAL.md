@@ -1,3 +1,310 @@
+## 2026-05-12 — Five bug-fix versions in one session, and "Ethni-city"
+
+Came in this morning with one item on the punch list: "test v0.0.17 on a
+fresh-start flow (non-useMyLastApplication)." Closed the laptop tonight
+having shipped **v0.0.18 → v0.0.22** — five tagged versions, five
+distinct bug classes, all surfaced by running the agent against a real
+Nvidia application I haven't touched before. None of these were on
+yesterday's "what's next" list. They didn't exist in my head until I
+saw them fail.
+
+This is, I think, the most productive session I've had on this project.
+It's also the one where I learned the most about how fragile the line
+is between "the tool works" and "the tool quietly does the wrong thing
+in a way no one notices until it's embarrassing."
+
+**v0.0.18 — respect existing manual choices.**
+
+I'd manually picked NVIDIA.COM in the "How Did You Hear About Us?"
+dropdown before running the agent (because I was applying through
+Eightfold and didn't want the agent to wipe that). The agent ran, saw
+the chip showing "NVIDIA.COM", didn't recognize it as matching the
+profile's "Internet Advertisement", and tried to overwrite. The
+hierarchical drill ate the popup state and the agent gave up. End
+result was right by accident — my manual NVIDIA.COM survived because
+the overwrite failed — but the design was wrong.
+
+The fix is a policy change as much as a code change: when a field
+already shows a non-default value that doesn't match the profile
+target, respect the existing value. Don't try to write over it. Skip,
+log distinctly. The check sits in two places:
+
+- **Combobox typeaheads**: main-world pre-flight chip readback (fresh
+  DOM, not the stale `field.context` from scan time). New
+  `'skip-preselected'` status threads back to the content script.
+- **All other widgets** (text inputs, button-selects, radios,
+  checkboxes, native selects): a `hasUnmatchedExistingValue` helper
+  inspects the live element and decides whether to fill or respect.
+
+This change ended up saving me from worse bugs later in the same
+session. Specifically: when I manually clicked "Yes" to correct the
+work-authorization screw-up (more on that below) BEFORE updating the
+profile, the agent's next run respected my manually-clicked Yes
+instead of re-writing No on top. That's belt-and-suspenders behavior I
+hadn't planned for but was very glad to have.
+
+**v0.0.19 — boolean values can't find Yes/No options.**
+
+Hit the work-auth step. Agent log:
+
+```
+fillButtonWidget: no option matched "false". Searched variants:
+  ["false"]. Listbox has 3 option(s): ['Select One', 'Yes', 'No']
+```
+
+The profile had `authorizedToWorkInUS: false` (boolean). The agent
+stringified it to literally `"false"` and looked for that string. No
+match. Workday's listbox uses Yes/No labels — the radio path handles
+booleans because the HTML `value` attribute on Workday radios is
+literally `"true"`/`"false"`, but button-selects don't have that escape
+hatch. Cross-widget gap I'd never noticed because I'd only tested
+booleans on radio Yes/No questions until now.
+
+Fix: extend `searchVariants` to add Yes/No alternatives when the input
+is `"true"`/`"false"`. One-line change. Covers buttons, comboboxes, and
+native selects in one place.
+
+**v0.0.20 — the silent-false-default catastrophe.**
+
+Same step, after the v0.0.19 fix. Agent ran. Log:
+
+```
+fillButtonWidget: clicking option "No" for target "false"
+```
+
+I noticed it had filled "No" for "Are you legally authorized to work in
+the United States?" I'm a US citizen. The answer is Yes. **The agent
+had just answered a federally-significant employment question wrong.**
+
+The chain of failure: `createEmptyProfile()` defaults
+`authorizedToWorkInUS: false`. My capture flow had never visited a
+page with this question, so the field stayed at its default. Profile
+says `false`. Agent reads `false`, looks up "No" via the v0.0.19 fix,
+clicks it. Everything worked perfectly — and produced an exactly-wrong
+answer.
+
+This is the bug class that would kill product trust in a beat. It's
+also the bug class that's most invisible: the agent doesn't know
+anything is wrong. The user has to spot it. If you're tabbing through
+a 20-step application at speed, you don't.
+
+The structural fix: make `WorkAuthorization` fields `boolean | null`,
+default `null` in `createEmptyProfile`. The fill path already skips
+`value == null`, so uncaptured legal questions now stay alone until
+the user explicitly captures an answer. **Schema represents "we don't
+know yet" as distinct from "user said No."**
+
+Same fix applied to all four work-auth fields — `requiresUSSponsorship`,
+`sanctionedCountryCitizenOrResident`, `currentOrFormerUSGovEmployee`.
+Same risk profile.
+
+For my own profile, I manually clicked Yes, opened the popup, clicked
+Save as Profile. v0.0.18's respect-existing-value policy meant the
+stale `false` in my profile didn't overwrite the Yes I'd just clicked.
+The capture then read my Yes and wrote `authorizedToWorkInUS: true`.
+Self-correcting through two layers of policy. Pleasant.
+
+**v0.0.21 — the "Ethni-city" bug.**
+
+This one is going in the LinkedIn post.
+
+Pushed past Work Auth. Next step (Voluntary Disclosures, I think — the
+URL didn't change, Workday's SPA was being inscrutable). Ran the agent.
+Log:
+
+```
+fillByWidget: path=contact.address.city tag=button type=button
+  uxi=null value="Medina"
+fillButtonWidget: no option matched "Medina". Listbox has 9 option(s):
+  ['Select One', 'American Indian or Alaska Native (Not Hispanic or
+  Latino) (United States of America)', 'Asian (Not Hispanic or Latino)
+  (United States of America)', 'Black or African American...']
+```
+
+The agent thought a Race/Ethnicity button was the City field. It tried
+to fill "Medina" into a race dropdown.
+
+Why? Because the mapping table at line 109 says
+`{ label: 'City' }` for `contact.address.city`. And the matcher uses
+`.toLowerCase().includes()`. And **"ethnicity" contains "city" as the
+last four letters.** Ethni-**city**.
+
+Mapping order put City before Race/Ethnicity, so the City mapping won
+the field. The agent stringified my "Medina" and went looking for it
+in a list of races.
+
+Surgical fix: anchor the City pattern with a word boundary regex
+(`/\bCity\b/i`). Still matches "City", "City*", "City Required". Stops
+matching "Ethnicity". Latent variants of this bug exist for other
+plain-string mappings — "First Name" would substring-match "Preferred
+First Name", for instance — but those aren't firing today because of
+mapping order. Left them in for a broader audit pass.
+
+This is the bug I'll lead the LinkedIn post with. It's funny, it's
+self-explanatory, and it makes the build-in-public point honestly:
+**a senior PM with no engineering background can absolutely catch
+production-level bugs with a debugger and a lot of squinting. Some of
+them are the funny kind.**
+
+**v0.0.22 — Self-Identify of Disability had two issues, neither
+expected.**
+
+Manually filled in Voluntary Disclosures (gender, race, veteran) and
+captured. Profile looked clean. Then advanced to Self-Identify of
+Disability, filled it manually, captured again. Pulled the profile
+dump:
+
+```json
+"voluntaryDisclosures": {
+  "gender": "Male",
+  "raceEthnicity": "White (Not Hispanic or Latino) (United States of America)",
+  "veteranStatus": "I AM NOT A VETERAN",
+  "disabilityStatus": false
+}
+```
+
+`disabilityStatus: false`. Schema says `disabilityStatus?: string`.
+Runtime got a boolean. The capture's `readValue()` returns
+`field.checked` for radios, and the disability question's "No, I do
+not have a disability" radio was the checked one — so capture wrote
+`field.checked` (boolean true, I think, or maybe false from a later
+radio overwriting earlier — radio capture has order-of-scan bugs I
+didn't unpack today) into a string-typed slot. TypeScript doesn't
+enforce at runtime. The bad data persisted.
+
+Same dump had this beauty in customAnswers:
+
+```json
+{ "pattern": "05/12/2026", "answer": "12" }
+```
+
+The Disability form has a "Today's Date" field. Workday auto-prefills
+it. The capture saw a field with no useful label/context/ariaLabel and
+fell back to using the rendered date as the pattern. Then captured
+only the day-of-month "12" as the answer. Pattern-keyed customAnswers
+never match future applications because the date changes every day.
+This entry will sit in my profile forever, harmless but ugly.
+
+Two fixes in v0.0.22:
+
+1. **VD radios capture option text.** When a field's mapping path
+   starts with `voluntaryDisclosures.` and it's a radio with a
+   `"Question → Option"` label, write the Option text (string) instead
+   of the checked boolean. Unchecked radios in the group are skipped
+   — the matched one carries the answer for the whole question. This
+   matches what the customAnswers fallback was already doing for
+   unmapped radios.
+2. **Date-shaped patterns rejected from customAnswers.** Regex check
+   in the unmapped-field fallback: if the pattern matches MM/DD/YYYY
+   or similar, skip and don't write the customAnswer. Stops the date
+   garbage from polluting the profile.
+
+WorkAuthorization radios still capture booleans because those types
+are `boolean | null` on purpose. Special-cased VD only.
+
+**The session's three cross-tenant catalog mismatches.**
+
+This wasn't a bug to fix, but it was a pattern that kept showing up
+and is worth naming. My profile values came from workday-corp
+(Workday's own careers tenant), and three times today I watched the
+agent correctly identify that a profile value didn't exist in Nvidia's
+catalog:
+
+- `preferredSource: "Internet Advertisement"` — Nvidia's source
+  dropdown doesn't have this value.
+- `contact.phone.deviceType: "Mobile"` — Nvidia's listbox is
+  `['Select One', 'Home', 'Home Cellular']`.
+- `education[0].degree: "Associate of Arts"` — Nvidia's listbox has
+  17 options including "Associates" but not "Associate of Arts".
+
+In every case the agent skipped rather than picking a wrong-but-close
+option. That's the right default behavior — the alternative is the
+v0.0.20 silent-false-default class of bug, transplanted to dropdowns.
+Cross-tenant catalog drift is a real product limitation, not an agent
+bug, and it's worth naming honestly in the LinkedIn post: tenant
+configurability is the dominant source of partial fills, not anything
+in the agent's code.
+
+**What I learned the hard way today.**
+
+- **Substring matching is a footgun, even when the matched substrings
+  are short and obvious.** "Ethni-city" was hiding in plain sight in
+  a config file I'd read dozens of times. Pattern-matching code in
+  production should default to anchored matches unless there's a
+  specific reason to be permissive.
+- **Schema types are aspirational without runtime enforcement.** Three
+  separate places in my profile turned out to have data that violated
+  the declared TypeScript types — disabilityStatus stored as boolean
+  where string was expected, raceEthnicity stored as single string
+  where `string[]` was expected, workAuthorization stored false-by-
+  default where the semantic was "no answer." The TypeScript compiler
+  was happy. The data was wrong.
+- **Default false is dangerous.** "Defaulting to false" is the
+  programmer's lazy version of "unknown." In legal/employment
+  contexts, the consequence of the laziness is silently mis-answering
+  a question that has actual real-world stakes. Nullable booleans
+  cost almost nothing in code and remove a whole class of bug.
+- **Building in public means showing the bugs too.** The Ethni-city
+  bug, the silent-false work-auth bug, the schema-violation
+  disability bug — these are exactly the things a LinkedIn-post-with-
+  a-pretty-demo would gloss over. They're also the texture that
+  makes the build narrative interesting to read. I want to lead with
+  them.
+- **The v2-deferred fresh-start gap is actually a single-click gap.**
+  Yesterday's CLAUDE.md said work-experience and education sections
+  on fresh-start applications need "Add Another" automation to fill
+  multiple blocks. True. But the gap before the FIRST block is also
+  there: on Nvidia, fresh-start renders zero work blocks until you
+  click Add. The v2 scope clarifies to: "click Add N times before
+  filling blocks 0..N-1." Less terrifying than I'd thought.
+
+**Ship readiness assessment.**
+
+The tool fills end-to-end on a real Nvidia application with 0 errors.
+The catalog-mismatch skips are explainable, not bugs. The
+workAuthorization fix removes the biggest "would have been
+embarrassing in production" risk I knew about. The respect-existing-
+value policy means the agent now plays nice with manual edits.
+
+Five versions of demonstrable progress in one session is enough
+material to write the LinkedIn post. The remaining "what's next" is:
+
+1. **A 30-second screen capture demo** showing the agent fill a
+   contact-info step end-to-end. Win+Alt+G or Loom. Probably the
+   single highest-leverage thing left to produce.
+2. **README + install instructions** for anyone who wants to clone
+   and try it. Currently doesn't exist.
+3. **The post itself.** I think it writes itself now. Opening hook is
+   Ethni-city. Middle is the React-fiber + main-world hybrid
+   architecture from the v0.0.10-v0.0.17 arc. Closer is the
+   silent-false work-auth bug as the punchline of "things you don't
+   know your tool is doing wrong until you watch it run."
+
+If I keep my head down, I can ship the post **tomorrow night**.
+Realistic plan: tomorrow morning I record the demo, write the
+README in the afternoon, draft the post in the evening, sleep on it,
+post Thursday.
+
+**Untouched today, deferred.**
+
+- v2 multi-block "Add Another" automation. Single-click-gap clarified
+  but still v2.
+- The latent substring-matching bugs in firstName / middleName /
+  lastName mappings. Will audit before next session.
+- The date-input handling — currently silently skipped, would be
+  nice to have an explicit "$dateMonth"/"$dateYear"-style sentinel
+  for free-standing date fields like "Today's Date" or "Signature
+  Date."
+- The 16-vs-12 logging gap in fillByWidget — some skip paths don't
+  print a per-field log. Minor diagnostic issue.
+- Email mapping. My profile has `contact.email: ""` because the
+  capture flow never visited a page that exposed an email input.
+  Need a mapping signal for it, or a way to capture from the
+  candidate-account-level fields.
+
+Nothing on this deferred list blocks the post. They're all the kind of
+thing I'll fix as they surface on subsequent applications.
+
 ## 2026-05-11 — Turns out yesterday's wall was diagnosing the wrong thing
 
 Going into today I had a one-line punch list: "DevTools spike on
