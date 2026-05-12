@@ -1,3 +1,185 @@
+## 2026-05-11 — Turns out yesterday's wall was diagnosing the wrong thing
+
+Going into today I had a one-line punch list: "DevTools spike on
+`onSelectInputClick.toString()`, then either confirm it needs focus, or
+needs `isTrusted`, or needs `stateNode` dispatch, or some
+`preventDefault`-able arg shape." Those were the four hypotheses
+yesterday's journal entry locked in. Three sessions later, I can say
+with confidence: **all four were wrong**, and the actual problem was
+somewhere I wasn't looking.
+
+**The MCP detour that turned out to matter.**
+
+Today I tried something new — drove a Chromium browser via the
+Playwright MCP server directly from Claude. The idea: skip the
+"Ben-at-the-keyboard-with-DevTools-open" handoff and let the agent run
+the spike itself. Setup was zero (already configured in this session)
+and there was useful friction worth journaling: the Playwright browser
+runs its own fresh profile, so my extension wasn't loaded in it. We
+agreed to use Playwright purely as remote DevTools for the spike, then
+hand the fix back to my real Chrome for end-to-end verification. That
+turned out to be the right split — the spike phase needed fast,
+iterable JavaScript evaluation against live React fibers; the verify
+phase needed the actual bundled extension running.
+
+Auth wall came up early. Workday's app pages need a candidate account,
+so I pointed it at a job I'd already applied to on Nvidia's tenant.
+Real PII was visible to the agent during the snapshots. Worth keeping
+in mind for the LinkedIn-post version: redact, or use a dummy tenant.
+
+**The spike data, condensed.**
+
+First experiment: dump `onSelectInputClick.toString()` on the empty
+source-dropdown input. Answer:
+
+> `() => { U() }`
+
+Takes no arguments. So `isTrusted`, focus state, arg shape — all dead.
+The handler just calls a closure variable `U` (probably
+`setMultiSelectDisplayState`, based on reading the depth-10 component
+source). Second experiment: actually invoke it in isolation. The
+listbox opened. With the six top-level categories visible.
+
+That's when I realized v0.0.16 had been WORKING for openers all along.
+The "empty combobox doesn't open" diagnosis from yesterday was a
+correlation, not a causation.
+
+Third experiment: try the v0.0.16 full sequence in the spike sandbox —
+open + filter + DOM-click on the option. The option click DID NOTHING.
+That's the actual wall. Workday's listbox options have no `onClick` on
+the option element itself. The selection wiring is at depth 2 of the
+option's fiber, on a parent `t` component, prop name `onSelect`,
+signature `(item, evt, undefined)` where `item = { index }` and `evt`
+must have a callable `preventDefault` (the inner
+`handleSelectionEvent` calls it).
+
+I verified the recipe end-to-end against the live Nvidia page:
+opener → onSelect on "Social Media" (index 3) → category expanded to
+8 sub-options including Facebook → onSelect on "Facebook" (index 1)
+→ chip indicator updated to `"1 item selected, Facebook"`. Done. The
+last screenshot showed the Workday form with the chip filled in by
+JavaScript I'd written 90 seconds earlier.
+
+**The implementation pass, and three regressions caught by real-Chrome
+verify.**
+
+Wrote v0.0.17. Replaced `dispatchClickSequence` in main.ts with
+`invokeReactOnSelect` (walks option's fiber for onSelect, calls with
+the right shape). Added a hierarchical walker that drills via
+`onSelect` and resets between attempts by calling `onAutoHidePopup`
+then `onSelectInputClick`. Refactored `findOptionMatch` to take a
+listbox directly so the hierarchical phase can match within drilled
+sub-lists. Removed `tryHierarchicalSelect` from content.ts entirely
+— ~120 lines of dead code that had used `dispatchClickSequence` and
+therefore never actually expanded a category.
+
+Then I handed off to my own Chrome. Three rounds of "doesn't quite
+work" before it shipped, each round revealing something I hadn't
+predicted:
+
+1. **First retest: no listbox after opener.** Same problem the journal
+   had described. But this time I could see the bigger picture:
+   content.ts had typed "Internet Advertisement" into the input as
+   part of Step 3 (the per-character typing path). That typing put
+   Workday's combobox into a state where calling `onSelectInputClick`
+   afterward no longer opened the picker. Step 3 had been documented
+   as "doesn't trigger Workday's filter, kept for forward-compat"
+   since v0.0.8 — but nobody had noticed it was ACTIVELY breaking the
+   v2 path by polluting input state. Removed it. Also removed
+   `typeIntoCombobox`, `filterQueryFor`, and a local
+   `setInputValueViaProto` that was no longer used.
+
+2. **Second retest: drilling into "Advertisement" but no sub-list
+   found.** The picker found the right category by name priority, but
+   after the drill there was no listbox we recognized. Added a
+   diagnostic that dumps option counts + visibility for each listbox
+   in the DOM when `findListboxFor` returns null.
+
+3. **Third retest: the diagnostic revealed the real shape.** The
+   3-listboxes-after-drill state included a 1-option listbox with
+   text "Internet Advertisement" — i.e., the chip indicator showing
+   the selection had ALREADY COMMITTED. We just didn't recognize it,
+   because my chip-detection only matched the "N items selected, X"
+   wrapper text pattern from Nvidia's tenant. Workday-corporate's
+   tenant doesn't put that prefix anywhere — the chip is JUST a
+   1-option listbox. So I broadened chip-detection to also accept
+   1-option listboxes within ~10 hops of the input in DOM tree.
+
+4. **Plus: filter-primed onSelect.** While I was at it, I added a
+   Phase D2 that invokes `onSelect` on the first visible option even
+   when no flat match exists, then checks the chip. On the Workday
+   tenant, Workday's internal state apparently maps `index: 0` of the
+   filtered top-level list to the actual matching leaf, so clicking
+   "Advertisement" at index 0 (after onSearch("Internet
+   Advertisement") primed the filter) commits "Internet
+   Advertisement" directly without needing the drill. This is the
+   path that ended up winning in the final run.
+
+5. **Defensive final chip-check.** Before returning `no-match`, I
+   added one last chip-readback. If anything along the way committed
+   the selection — even by an unintended pathway like an
+   `onAutoHidePopup` triggering Workday's CLICK_OUTSIDE-best-match
+   commit during a hierarchical reset — the chip is ground truth.
+   Report `filled`.
+
+**Final live result.**
+
+```
+[WorkdayAgent main-world] filter-primed onSelect committed "Internet Advertisement"
+status:"filled" ... chosenOption:"Internet Advertisement"
+fill complete — 15 filled, 2 skipped, 0 errors
+```
+
+Up from 14/3 in v0.0.16. The two skipped are the correctly pre-filled
+combos (Country and Country Phone Code). Zero errors. Zero false
+positives. The empty source dropdown — yesterday's "deferred to a
+future session" item — now fills end-to-end.
+
+**What I learned the hard way today.**
+
+- **Yesterday's hypotheses were wrong because they pattern-matched to
+  what I expected, not what I actually saw.** All four were variations
+  on "the opener needs special treatment." The real failure was at the
+  option-click level, two steps later in the flow. A spike that reads
+  the handler source — not just enumerates handler names — surfaced
+  the truth in 90 seconds.
+- **`<function>.toString()` is the most underused debugging primitive
+  in this whole project.** Minified code, sure, but it's intelligible.
+  Reading `() => { U() }` was more informative than reading the
+  handler's prop name a thousand times.
+- **Per-tenant variation is real, even on the same Workday platform.**
+  Nvidia's source dropdown drills inline into sub-options with the
+  same listbox. Workday-corp's commits the matching leaf directly
+  when you click the first filtered option. Same platform, same
+  CSS-in-JS components, different tenant configuration → different
+  behavior. Multi-tenant test-matrix is going to matter eventually.
+- **Removing broken code can fix things.** The Step 3 typing path had
+  been "harmlessly" running for sessions. It was actively breaking
+  the v2 fallback. The fact that I'd labeled it "forward-compat" in
+  a comment made it socially harder to delete. Worth noting for the
+  LinkedIn post: "I removed 120 lines of dead-but-labeled-load-bearing
+  code and the actual bug went away."
+- **Browser-driven MCP is genuinely useful for spikes that need
+  in-page JS evaluation.** Not a substitute for end-to-end verify in
+  the real extension environment — but for "what's actually in this
+  React fiber chain on a live page?" it's better than the
+  Ben-at-keyboard handoff. Split the work: spike via MCP, verify via
+  real Chrome.
+
+**What's next.**
+
+- Test v0.0.17 on a fresh-start (non-"useMyLastApplication") flow to
+  confirm work-experience and education sections behave. v0.0.17 only
+  fixed combobox typeaheads; the repeated-block "click Add Another"
+  limitation is still v2-deferred.
+- Test on Voluntary Disclosures step if I can find a tenant that
+  exposes those.
+- Decide if the LinkedIn post writes itself yet. Current narrative
+  arc: "I'm a PM, I built a Chrome extension in a weekend, here's
+  what I learned about React's internals and Workday's DOM and the
+  gap between what code looks like it's doing and what it's actually
+  doing." With v0.0.17 shipped, the demo is real.
+
 ## 2026-05-10 — Fixed the merge bug, then hit the wall I'd been warned about
 
 Two bugs going in. One fixed and verified, one diagnosed and deferred to v2.
@@ -541,7 +723,7 @@ Slow down and read the output.
 
 **Working name:** `workday-autofill-agent` (GitHub repo) / "WorkdayAgent" (referential)
 **Started:** May 2026
-**Status:** v0.0.16 — verified end-to-end on contact-info step at 14 filled / 3 skipped / 0 errors. Bug 1 (merge architecture, v0.0.6) verified live. v2 main-world architecture verified live as of v0.0.10–v0.0.16: dynamic-import-from-MAIN works under Workday's CSP, React fiber traversal works, `onSearch` handler discovery works, opener `onSelectInputClick` discovery works, listbox lookup is properly scoped to the source input, skip-if-already-filled works for both comboboxes and button widgets. **Remaining limitation:** an EMPTY Workday combobox (no chip yet) doesn't open its listbox in response to any React handler we currently call — including the correctly-discovered `onSelectInputClick` at depth 10. Resolving requires DevTools inspection of `onSelectInputClick.toString()` on a real Workday tenant to see what argument shape / state it expects; deferred to a future session.
+**Status:** v0.0.17 — verified end-to-end on contact-info step at 15 filled / 2 skipped / 0 errors (workday.wd5 Engagement Manager tenant). Empty hierarchical source dropdown ("How Did You Hear About Us?" → "Internet Advertisement") fills correctly via filter-primed onSelect; v0.0.16's "remaining limitation" turned out to be misdiagnosed — opener was working all along; the real gap was option-clicks. Workday's listbox options don't fire on real DOM events; selection goes through React's `onSelect` at depth 2 of the option's fiber, signature `(item, evt, undefined)`. v0.0.17 invokes that path directly. Chip-detection now supports both Nvidia-style (`"N items selected, X"` wrapper text) and Workday-corp-style (1-option listbox near input) tenants. Removed dead code: content-script's `tryHierarchicalSelect` (used DOM clicks, never actually worked) and `typeIntoCombobox` (was actively breaking the v2 path by polluting input state before opener invocation).
 
 ## What this is
 
