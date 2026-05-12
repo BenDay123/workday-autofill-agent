@@ -2,21 +2,29 @@
 // DOM element refs), walks the fields and writes profile values into the
 // page using widget-appropriate techniques.
 //
-// Architecture decision: content-script-only rather than the two-script
-// (content + injected) pattern documented in CLAUDE.md. Reasoning: the
-// React-input-tracking issue is solved by using the native value setter from
-// HTMLInputElement.prototype (skips React's instance-level monkey-patch) and
-// dispatching standard events on the live element. That works from any JS
-// context that holds a reference to the element. If we hit a Workday widget
-// where this fails, the fallback is to add an injected script — but for v1
-// we keep it simple. Documented in JOURNAL.md (2026-05-09).
+// Architecture: hybrid. Most widgets use content-script-only fills with the
+// native value setter trick (Object.getOwnPropertyDescriptor on
+// HTMLInputElement.prototype → setter call → dispatch input/change/blur)
+// to bypass React's per-instance value tracker. This works from the
+// isolated world because the prototype's setter is callable from any JS
+// context with a reference to the element.
+//
+// Combobox typeahead is the exception. Verified live: Workday's option
+// selection doesn't fire on real DOM clicks — selection goes through
+// React's onSelect prop on the option's fiber, and the empty-state
+// opener goes through onSelectInputClick on the input's fiber. Neither
+// is reachable from the isolated world. So fillCombobox falls through
+// to a main-world injected script (src/injected/main.ts via
+// src/injected/bridge.ts) that walks React fibers and invokes the
+// handlers directly. See JOURNAL.md (2026-05-11) for the spike that
+// established the contract.
 //
 // Widget dispatch:
 //   - input[type="text|email|tel|...]" / textarea  → fillTextInput
 //   - input[type="checkbox"]                       → fillCheckable (toggle if state differs)
 //   - input[type="radio"]                          → fillCheckable (match by option value/label)
 //   - input[role="combobox"] / uxiElementId="selectinput-*"
-//                                                  → fillCombobox (focus + type + click match)
+//                                                  → fillCombobox → main-world for empty/hierarchical
 //   - button[aria-haspopup="listbox"]              → fillButtonWidget (click + wait + click match)
 //   - select                                       → fillSelect
 //
@@ -386,9 +394,8 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
   // Step 0: close any listboxes left open by previous fills. Workday
   // doesn't always close the previous widget's listbox before the next
   // one opens, which causes `findOptionMatchInLatestListbox` (DOM-order
-  // last-wins) to read the wrong listbox and confuses the hierarchical
-  // walker (e.g., reads the phone-device-type listbox while filling
-  // the country-phone-code combobox).
+  // last-wins) to read the wrong listbox (e.g., the phone-device-type
+  // listbox while filling the country-phone-code combobox).
   closeOpenListboxes();
   await sleep(80);
 
@@ -406,34 +413,22 @@ async function fillCombobox(inputEl: HTMLInputElement, targetValue: string): Pro
     return true;
   }
 
-  // Step 2b: hierarchical fallback — if the listbox is small and none of
-  // the options match, try clicking each top-level option to see if it
-  // expands into a sub-list containing the target (Workday's tree-style
-  // pickers, e.g., "How Did You Hear About Us?" where the top level is
-  // categories and "Internet Advertisement" lives inside "Advertisement").
-  const hierarchical = await tryHierarchicalSelect(targetValue, inputEl);
-  if (hierarchical) return true;
+  // Step 2b removed in v0.0.17: hierarchical drill-in moved to the
+  // main-world v2 path. The previous content-script implementation
+  // used dispatchClickSequence to "expand" category options, but
+  // Workday's options don't fire on real DOM clicks — selection goes
+  // through React's onSelect, which only the main-world script can
+  // invoke. The v2 path handles both flat AND hierarchical pickers.
 
-  // Step 3: type a filter query character-by-character (legacy v1 path).
-  // As of v0.0.8 this does not actually trigger Workday's React filter
-  // — kept for forward-compat in case Workday changes filter wiring or
-  // a different tenant responds differently.
-  const filterQuery = filterQueryFor(targetValue);
-  console.log(`[WorkdayAgent] fillCombobox: typing filter "${filterQuery}" for target "${targetValue}"`);
-  await typeIntoCombobox(inputEl, filterQuery);
+  // Steps 3 & 4 removed in v0.0.17: per-character typing never actually
+  // triggered Workday's React filter (verified v0.0.8) AND it actively
+  // breaks the v2 main-world path. After typing, the combobox's internal
+  // state lands in a mode where `onSelectInputClick()` no longer opens
+  // the picker, so the v2 fallback found no listbox and gave up. Going
+  // straight from "no flat match" to the v2 path keeps the input
+  // pristine when main-world walks the fibers.
 
-  // Step 4: short poll for the filtered list to populate from typing.
-  for (let i = 0; i < 4; i++) {
-    await sleep(150);
-    match = findOptionMatchInLatestListbox(targetValue, inputEl);
-    if (match) {
-      console.log(`[WorkdayAgent] fillCombobox: clicking filtered match for "${targetValue}":`, match.textContent?.trim());
-      dispatchClickSequence(match);
-      return true;
-    }
-  }
-
-  // Step 5 (v2 path): delegate to the main-world injected script. It can
+  // Step 3 (v2 path): delegate to the main-world injected script. It can
   // see React fibers and invoke the combobox's React handler directly,
   // which the content-script's synthetic DOM events can't reach.
   const mainWorldOk = await tryMainWorldFill(inputEl, targetValue);
@@ -478,7 +473,10 @@ async function tryMainWorldFill(
 
   try {
     const variants = searchVariants(targetValue);
-    const response = await requestComboboxFill(selector, targetValue, variants);
+    // 8s timeout: hierarchical walking can do up to 6 category attempts
+    // × ~500ms reopen + drill = ~3s in the worst case. The default 4s
+    // bridge timeout is too tight.
+    const response = await requestComboboxFill(selector, targetValue, variants, 8000);
     console.log('[WorkdayAgent] main-world combobox-fill (raw JSON):', JSON.stringify(response));
     return response.status === 'filled';
   } catch (err) {
@@ -514,189 +512,6 @@ function cssEscape(value: string): string {
 // "Socially", "Website", "Workday") and the user drills in to find leaf
 // options like "Internet Advertisement". This walks each top-level
 // option, clicks it to expand, checks if the latest listbox contains a
-// match for the target, and clicks the match if found. Backs out if
-// no match by clicking the category again (to collapse) before moving
-// to the next.
-async function tryHierarchicalSelect(
-  targetValue: string,
-  sourceEl: Element,
-): Promise<boolean> {
-  const listbox = findListboxFor(sourceEl);
-  if (!listbox) return false;
-  const topLevelOptions = Array.from(
-    listbox.querySelectorAll('[role="option"]'),
-  ) as HTMLElement[];
-  if (topLevelOptions.length === 0 || topLevelOptions.length > 10) {
-    // Tree pickers in practice have few top-level categories. If the list
-    // is large, it's a flat list (or paginated) and hierarchical walking
-    // would just be noisy and slow.
-    return false;
-  }
-
-  // Snapshot the initial option labels so we can detect when clicking a
-  // category replaces them (vs. expanding inline).
-  const initialLabels = new Set(
-    topLevelOptions.map((o) => o.textContent?.trim() ?? ''),
-  );
-  console.log(
-    `[WorkdayAgent] tryHierarchicalSelect: attempting drill-in for "${targetValue}" across ${topLevelOptions.length} categories: ${JSON.stringify(Array.from(initialLabels))}`,
-  );
-
-  for (const category of topLevelOptions) {
-    const categoryLabel = category.textContent?.trim() ?? '';
-    // Heuristic: prioritize the category whose name is a prefix/substring
-    // of the target. "Internet Advertisement" → try "Advertisement" first.
-    // We'll still walk the rest if the prioritized one doesn't yield.
-    // (Implemented below as a re-sort.)
-    void categoryLabel; // silence unused warning in current pass
-  }
-
-  // Sort: categories whose name appears as a token in the target come first.
-  const targetTokens = targetValue.toLowerCase().split(/\s+/);
-  topLevelOptions.sort((a, b) => {
-    const al = (a.textContent ?? '').toLowerCase().trim();
-    const bl = (b.textContent ?? '').toLowerCase().trim();
-    const aMatch = targetTokens.some((t) => t === al || al.includes(t) || t.includes(al));
-    const bMatch = targetTokens.some((t) => t === bl || bl.includes(t) || t.includes(bl));
-    return (bMatch ? 1 : 0) - (aMatch ? 1 : 0);
-  });
-
-  for (const category of topLevelOptions) {
-    const categoryLabel = category.textContent?.trim() ?? '';
-    console.log(`[WorkdayAgent] tryHierarchicalSelect: clicking category "${categoryLabel}"`);
-    dispatchClickSequence(category);
-    await sleep(300);
-
-    const match = findOptionMatchInLatestListbox(targetValue, sourceEl);
-    if (match) {
-      const matchLabel = match.textContent?.trim() ?? '';
-      // After clicking the category, the listbox we now read should be
-      // associated with our sourceEl. If the click had a side effect on
-      // an unrelated widget, the lookup might find a different listbox
-      // — require:
-      //   1) the match isn't the category itself
-      //   2) the match wasn't already in the top-level option set
-      //   3) the listbox containing the match has multiple options
-      //      (real drill-down sub-lists do, single-option indicators
-      //      don't)
-      //   4) the listbox is NOT our original top-level listbox
-      const currentListbox = findListboxFor(sourceEl);
-      const optionCount = currentListbox
-        ? currentListbox.querySelectorAll('[role="option"]').length
-        : 0;
-      const isStaleSingleOption = optionCount <= 1;
-      const isSameListboxAsTopLevel = currentListbox === listbox;
-      const matchedSelf = matchLabel === categoryLabel;
-      const matchedExistingTopLevel = initialLabels.has(matchLabel);
-
-      if (
-        matchedSelf ||
-        matchedExistingTopLevel ||
-        isStaleSingleOption ||
-        isSameListboxAsTopLevel
-      ) {
-        console.log(
-          `[WorkdayAgent] tryHierarchicalSelect: rejected suspicious "match" — label="${matchLabel}" matchedSelf=${matchedSelf} matchedExistingTopLevel=${matchedExistingTopLevel} isStaleSingleOption=${isStaleSingleOption} sameAsTopLevel=${isSameListboxAsTopLevel}`,
-        );
-      } else {
-        console.log(`[WorkdayAgent] tryHierarchicalSelect: matched "${matchLabel}" under "${categoryLabel}"`);
-        dispatchClickSequence(match);
-        return true;
-      }
-    }
-
-    // No match under this category. Back out so the next category is
-    // reachable. If the listbox went back to the same top-level labels,
-    // the category click toggled rather than drilled — don't re-click
-    // (would re-expand). Otherwise click the category again to collapse.
-    const stillVisible = findListboxFor(sourceEl);
-    if (!stillVisible) {
-      console.log(`[WorkdayAgent] tryHierarchicalSelect: listbox closed after clicking "${categoryLabel}"; aborting`);
-      return false;
-    }
-    const currentLabels = new Set(
-      Array.from(stillVisible.querySelectorAll('[role="option"]')).map(
-        (o) => o.textContent?.trim() ?? '',
-      ),
-    );
-    const stillAtTopLevel = setsEqual(currentLabels, initialLabels);
-    if (!stillAtTopLevel) {
-      // Drilled into a sub-list — click the category again to back out.
-      dispatchClickSequence(category);
-      await sleep(200);
-    }
-  }
-
-  return false;
-}
-
-function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
-  if (a.size !== b.size) return false;
-  for (const v of a) if (!b.has(v)) return false;
-  return true;
-}
-
-// Build a SHORT filter query from the captured value. Workday's combobox
-// option text often differs from the chip text — chip "United States of
-// America (+1)" vs option "United States (+1)". Filtering by the full
-// chip text matches zero options and Workday reverts to the unfiltered
-// alphabetical first page. Trim heuristic:
-//   1. Drop a trailing parenthetical suffix ("(+1)")
-//   2. If multiple words remain, keep only the first 2 (so "United States
-//      of America" → "United States")
-// The full original value is still used for matching options after
-// filter via searchVariants.
-function filterQueryFor(targetValue: string): string {
-  let q = targetValue.replace(/\s*\([^)]*\)\s*$/, '').trim();
-  if (!q) return targetValue;
-  const words = q.split(/\s+/);
-  if (words.length > 2) q = words.slice(0, 2).join(' ');
-  return q;
-}
-
-// Simulate per-character typing so Workday's combobox filter fires.
-// Setting the whole value via prototype + dispatching `input` once isn't
-// enough. Each char fires keydown → beforeinput → input → keyup.
-async function typeIntoCombobox(el: HTMLInputElement, text: string): Promise<void> {
-  // Clear any prior value first.
-  setInputValueViaProto(el, '');
-  el.dispatchEvent(
-    new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }),
-  );
-  await sleep(30);
-
-  let current = '';
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    const keyInit: KeyboardEventInit = {
-      key: ch,
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-    };
-    el.dispatchEvent(new KeyboardEvent('keydown', keyInit));
-    el.dispatchEvent(
-      new InputEvent('beforeinput', {
-        bubbles: true,
-        cancelable: true,
-        data: ch,
-        inputType: 'insertText',
-      }),
-    );
-    current += ch;
-    setInputValueViaProto(el, current);
-    el.dispatchEvent(
-      new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }),
-    );
-    el.dispatchEvent(new KeyboardEvent('keyup', keyInit));
-    await sleep(20);
-  }
-
-  // Diagnostic: confirm the input's value reflects what we typed (debugging
-  // whether typing is the gap, or whether filter just isn't firing).
-  console.log(`[WorkdayAgent] typeIntoCombobox: input value after typing is "${el.value}"`);
-}
-
 // Dump the actual options visible in the latest listbox when a match fails,
 // alongside the search variants we tried. Helps diagnose why a captured
 // value (e.g., "United States of America (+1)") doesn't match Workday's
@@ -842,15 +657,6 @@ function domDistance(a: Element, b: Element): number {
     depth++;
   }
   return Number.POSITIVE_INFINITY;
-}
-
-function setInputValueViaProto(el: HTMLInputElement, value: string): void {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-  if (setter) {
-    setter.call(el, value);
-  } else {
-    el.value = value;
-  }
 }
 
 function sleep(ms: number): Promise<void> {
