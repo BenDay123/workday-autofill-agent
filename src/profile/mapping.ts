@@ -106,7 +106,11 @@ export const FIELD_MAPPINGS: FieldMapping[] = [
   { signals: [{ label: /^country/i }], path: 'contact.address.country' },
   { signals: [{ label: 'Address Line 1' }], path: 'contact.address.line1' },
   { signals: [{ label: 'Address Line 2' }], path: 'contact.address.line2' },
-  { signals: [{ label: 'City' }], path: 'contact.address.city' },
+  // Word-boundary anchored so it doesn't match "Ethnicity" via substring
+  // (matchString uses .includes() for plain strings — "ethni-city" contains
+  // "city"). Verified live 2026-05-12 on Nvidia's Voluntary Disclosures
+  // step where the Race/Ethnicity button stole the City fill of "Medina".
+  { signals: [{ label: /\bCity\b/i }], path: 'contact.address.city' },
   { signals: [{ label: 'State' }], path: 'contact.address.state' },
   { signals: [{ label: 'Postal Code' }, { label: 'Zip Code' }], path: 'contact.address.postalCode' },
 
