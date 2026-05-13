@@ -144,3 +144,6 @@ vite.config.ts.timestamp-*
 
 # Playwright MCP working files (snapshot YAMLs, console logs)
 .playwright-mcp/
+
+# Claude Code project-level config (local-only)
+.claude/
