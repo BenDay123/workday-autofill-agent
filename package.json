@@ -1,6 +1,6 @@
 {
   "name": "workday-autofill-agent",
-  "version": "1.0.0",
+  "version": "0.0.23",
   "description": "An agent that completes job application forms for employers on Workday",
   "main": "index.js",
   "scripts": {

@@ -5,11 +5,27 @@ import { getProfile, saveProfile } from '../profile/storage';
 
 console.log('WorkdayAgent popup loaded');
 
+const DEBUG_KEY = 'workdayAgent.debugMode';
+
 const statusEl = document.getElementById('status');
 const scanBtn = document.getElementById('scanBtn') as HTMLButtonElement | null;
 const captureBtn = document.getElementById('captureBtn') as HTMLButtonElement | null;
 const fillBtn = document.getElementById('fillBtn') as HTMLButtonElement | null;
 const outputEl = document.getElementById('output') as HTMLTextAreaElement | null;
+const debugToggle = document.getElementById('debugToggle') as HTMLInputElement | null;
+
+void (async () => {
+  const stored = await chrome.storage.local.get(DEBUG_KEY);
+  const enabled = Boolean(stored[DEBUG_KEY]);
+  document.body.classList.toggle('debug-on', enabled);
+  if (debugToggle) debugToggle.checked = enabled;
+})();
+
+debugToggle?.addEventListener('change', () => {
+  const enabled = debugToggle.checked;
+  document.body.classList.toggle('debug-on', enabled);
+  void chrome.storage.local.set({ [DEBUG_KEY]: enabled });
+});
 
 function setOutput(text: string) {
   if (!outputEl) return;
