@@ -38,6 +38,10 @@ function setStatus(text: string) {
   if (statusEl) statusEl.textContent = text;
 }
 
+function isDebugOn(): boolean {
+  return document.body.classList.contains('debug-on');
+}
+
 interface ScanResponse {
   count?: number;
   json?: string;
@@ -175,7 +179,9 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (head) sectionSet.add(head);
     }
     const sections = Array.from(sectionSet).join(', ') || 'none';
-    setOutput(JSON.stringify(merged, null, 2));
+    if (isDebugOn()) {
+      setOutput(JSON.stringify(merged, null, 2));
+    }
     setStatus(
       `✓ Merged. ${result.matched} matched, ${result.unmatched} unmatched, ${result.capturedCustomAnswers} custom answers. Updated: ${sections}.`,
     );
@@ -196,6 +202,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     }
 
     setStatus('Filling form (this can take a few seconds for dropdowns)...');
+    fillBtn.classList.add('loading');
 
     chrome.tabs.sendMessage(
       tabId,
@@ -208,6 +215,7 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         error?: string;
       } | undefined) => {
         setButtonsDisabled(false);
+        fillBtn.classList.remove('loading');
 
         if (chrome.runtime.lastError) {
           setStatus(`Fill failed: ${chrome.runtime.lastError.message}`);
