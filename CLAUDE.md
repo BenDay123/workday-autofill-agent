@@ -205,3 +205,21 @@ A Chrome extension that fills Workday job applications. Build-in-public.
   unmapped-field fallback skips patterns matching MM/DD/YYYY shapes.
   Explicit date-field handling (sentinels for "Today's Date" /
   signature dates) is a v2 nice-to-have, not in v1.
+- **Workday hosts are matched in TWO places (v0.0.25).** Workday
+  tenants live on more than one domain: `*.myworkdayjobs.com` AND
+  `*.myworkdaysite.com` (Snap is on the latter). Any host change must
+  touch both: (1) `vite.config.ts` — `host_permissions` + both
+  `content_scripts.matches` arrays (crxjs auto-propagates to
+  `web_accessible_resources`); (2) `src/popup/popup.ts` — the
+  `isWorkday` URL check that gates every popup button. Fixing only the
+  manifest makes the content script inject but leaves the popup
+  greying out Fill/Save/Scan. Known gap: other Workday-hosted domains
+  likely exist (`*.myworkdayjobs.us`, custom-domain proxies) — add as
+  encountered, don't speculatively wildcard (unused host_permissions
+  are a Chrome Web Store review smell).
+- **Version lives in two files, must move together.** The
+  user-visible version is `vite.config.ts`'s manifest `version` —
+  that is what Chrome shows. `package.json` `version` is separate.
+  v0.0.23 and v0.0.24 bumped only `package.json`, leaving the
+  manifest stale at 0.0.22 for a week. On every version bump, change
+  BOTH.

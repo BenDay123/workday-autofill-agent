@@ -18,7 +18,9 @@ Known gap I'm leaving for now: there are probably more Workday-hosted domains I 
 
 What I learned the hard way (twice in a row, apparently): the version field that *actually matters* to users is the manifest, not the package.json one. Worth a checklist item on future ships.
 
-**What's next.** Reload the unpacked extension at chrome://extensions and re-test on the Snap URL. If Fill runs cleanly there, the fix is done. If not, the next thing to look at is whether Snap's Workday is a customized variant — different DOM, different React signatures, different listbox structure — and we have a v2-scope problem, not a v1 manifest one.
+**Confirmed working.** Reloaded the unpacked extension, re-tested on the Snap URL — popup detects the page and Fill runs. v0.0.25 committed and pushed (`d067703`). Documented the two-place host-matching rule and the two-file version rule in CLAUDE.md so neither bites again.
+
+**What's next.** Back to the LinkedIn post — the v0.0.25 work was an unplanned bug detour. Post draft (tight, single-beat, Ethni-city lead, with the "five hardest parts" sentence) is in `post-draft.md`. Demo capture is cut — using a screenshot instead. Still need: finalize the post voice, pick the screenshot, post it. Open question carried from v0.0.24: the Fill error display still dumps JSON in the textarea; wants prettier rendering before it can move behind the debug toggle.
 
 ## 2026-05-13 — Polish day. Wrote the actual README, made the popup look intentional.
 
