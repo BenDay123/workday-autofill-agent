@@ -67,7 +67,9 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     return;
   }
 
-  const isWorkday = currentTab.url.includes('myworkdayjobs.com');
+  const isWorkday =
+    currentTab.url.includes('myworkdayjobs.com') ||
+    currentTab.url.includes('myworkdaysite.com');
   setStatus(
     isWorkday
       ? '✓ Workday page detected. Ready to assist.'

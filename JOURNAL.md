@@ -1,3 +1,79 @@
+## 2026-05-13 (later) — v0.0.25: extension missed half the Workday tenants. Also, the manifest version was stale for a week.
+
+Went to test the build on a Snap GPMM listing
+(https://wd1.myworkdaysite.com/recruiting/snapchat/snap/job/San-Francisco-California/Group-Product-Marketing-Manager_R0045424-1)
+and nothing happened. The popup loaded, but Fill did nothing. Scan returned nothing. The content script wasn't injecting at all.
+
+**Root cause — two hardcoded host strings, not one.** First: `vite.config.ts` had `host_permissions` and both `content_scripts.matches` hardcoded to `https://*.myworkdayjobs.com/*` only. Snap (and presumably other tenants) are hosted on `*.myworkdaysite.com` — a second Workday-owned domain I'd never seen. Added that pattern to all three locations; crxjs propagated it to `web_accessible_resources` too.
+
+Fixed that, rebuilt, reloaded — still not working. The second one: `src/popup/popup.ts` had its own `isWorkday` check (`currentTab.url.includes('myworkdayjobs.com')`) that gated every button in the popup. So even with the content script now injecting fine on the Snap page, the popup itself greyed out Fill/Save/Scan and showed "Navigate to a Workday application page." Two separate places, same hardcoded assumption. Fixed the popup to check both domains.
+
+Lesson: when a host/domain assumption is wrong, grep the *whole* codebase for it — not just the obvious config file. The manifest was the reported root cause and it was *a* root cause, but the popup gate was a second one hiding behind it.
+
+Why I never caught this: every tenant I tested on previously (workday.wd5, nvidia.wd5) was on `myworkdayjobs.com`. Snap was the first `myworkdaysite.com` I tried. Survivor bias — the extension worked on every site I tested it on, because I only tested it on sites where it could load.
+
+Known gap I'm leaving for now: there are probably more Workday-hosted domains I haven't seen (`*.myworkdayjobs.us`, custom-domain proxies that some big employers run). Will add them as they come up. Not worth speculatively wildcarding — host_permissions you don't need are a Chrome Web Store review smell when it eventually goes there.
+
+**The version-number cleanup.** Surprise side-quest. While bumping for this fix I noticed `vite.config.ts` was still on 0.0.22 even though the journal had logged v0.0.23 (Scan toggle) and v0.0.24 (popup polish) as shipped. `package.json` was correctly on 0.0.24 — only the manifest version was stale. Meaning Chrome had been reporting 0.0.22 on installs the whole time, even when I thought I was shipping a new version. Rather than backfill, I jumped manifest 0.0.22 → 0.0.25 and bumped package.json 0.0.24 → 0.0.25 to realign. Going forward both numbers move together.
+
+What I learned the hard way (twice in a row, apparently): the version field that *actually matters* to users is the manifest, not the package.json one. Worth a checklist item on future ships.
+
+**What's next.** Reload the unpacked extension at chrome://extensions and re-test on the Snap URL. If Fill runs cleanly there, the fix is done. If not, the next thing to look at is whether Snap's Workday is a customized variant — different DOM, different React signatures, different listbox structure — and we have a v2-scope problem, not a v1 manifest one.
+
+## 2026-05-13 — Polish day. Wrote the actual README, made the popup look intentional.
+
+Today the product itself didn't change. Same fill behavior as yesterday's v0.0.22. But everything around it — README, popup UX, the visible version number — got intentional. Two versions tagged (v0.0.23, v0.0.24), neither for a bug. First time in this project I've shipped pure polish.
+
+**The README.**
+
+The repo had a five-line README that basically said "in active build, not yet usable." That's been true since v0.0.1 and gradually got less true. Today it stopped being true.
+
+Wrote the actual pitch. Three sections:
+- How it's different (no upfront profile setup, Workday-only on purpose, local-only)
+- What it gets right (won't guess on legal questions, respects what you've already typed, fills voluntary disclosures)
+- What it doesn't do yet (no other ATS, no Add Another, no approximating absent dropdown values)
+
+Plus install instructions (clone, npm install, npm run build, load unpacked) and a Use it walkthrough.
+
+The thing I'm most pleased with: the "What it doesn't do" section. Naming limits up front earns the rest of the claims. It also reframes "Workday-only" from limitation to deliberate choice. "Narrow scope, sharp tool" did a lot of heavy lifting in four words.
+
+**Hiding the Scan button (v0.0.23).**
+
+Scan was a permanent dev affordance — equal real estate as Save and Fill in the popup, no context for a new user. Discussed with Claude whether to hide it behind a debug toggle. Claude initially pushed back: "you're two days from launch, don't add features." Fair point if there were a real deadline. The launch is self-imposed. I overrode.
+
+What Claude got right on the first pass: "skip icons even with infinite time, decorative not functional." What Claude got wrong: thinking I was on a deadline. The frame "we have time, re-evaluate" changed the answer in one direction (do the polish) but reinforced it in another (still skip the icons). Both decisions held up.
+
+The toggle itself is a checkbox at the bottom of the popup. Persists in chrome.storage.local at `workdayAgent.debugMode`. Hides the Scan button and its hint clause via a body class. Pure CSS toggle, no JS animation. Worked on the first build.
+
+**Popup polish (v0.0.24).**
+
+Two stacked white buttons looked programmer-default. Made Fill the primary action (filled near-black `#1F2937`), Save the secondary (outlined). Added focus rings, hover transitions, active press states. Added a CSS-only spinner that appears in the Fill button during the 5-15 second fill operation — fixes the "did it freeze?" moment every click had.
+
+Also moved Save's JSON dump to the textarea behind the debug toggle. Non-dev users now see `✓ Merged. 23 matched, 2 unmatched, 1 custom answers. Updated: contact, education.` instead of a wall of JSON. Fill error display is still JSON in textarea — needs prettier rendering before I can move it behind debug, that's a v0.0.25 task.
+
+**Visual verification via Playwright.**
+
+Used the Playwright MCP server to serve `dist/` over HTTP and render the popup in a headless browser, screenshot, evaluate. Doesn't catch chrome.storage.local persistence (extension context required) but does catch the visual hierarchy and the loading state. Caught issues earlier than I would have with manual reload-and-eyeball cycles. Saved two screenshots into the new `screenshots/` folder for the post.
+
+**Things I learned today.**
+
+- "We have time, why not" is dangerous as a frame. "We have time, so let me re-evaluate without the deadline anchor" is the same words but a much better question. Same options come out, but the reasoning is cleaner and you catch the over-corrections (e.g., skipping icons even when time is free).
+- I almost shipped a LinkedIn post yesterday with a popup that had three identical white buttons and a mystery "Scan" button. Glad I didn't. The screenshot in the post would have undercut the pitch.
+- Testing fatigue is real. Two Chrome reload-and-eyeball cycles in one session is the limit. For low-risk changes (CSS, copy, gitignore) static verification + ship-then-verify is the right cadence. Told Claude to save this as a preference.
+
+**Repo hygiene.**
+
+Moved three PNGs into `screenshots/`. Gitignored `.playwright-mcp/` (Playwright MCP working files) and `.claude/` (Claude Code project-level state). `git status` is clean for the first time in a week.
+
+**What's next.**
+
+LinkedIn post first draft started — see [post-draft.md](./post-draft.md). Still need:
+- 30-second demo capture (Win+Alt+G or Loom)
+- Iterate the post draft until the voice sounds like me, not a draft
+- Then actually post it
+
+Realistic timeline: there isn't one. Yesterday I thought I'd ship by Thursday. Today I'm fine taking another week. The tool is in better shape than yesterday and the next thing I add (demo + post) is the artifact, not more code.
+
 ## 2026-05-12 — Five bug-fix versions in one session, and "Ethni-city"
 
 Came in this morning with one item on the punch list: "test v0.0.17 on a
